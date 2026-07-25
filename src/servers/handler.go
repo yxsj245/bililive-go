@@ -91,9 +91,11 @@ func parseInfo(ctx context.Context, l live.Live) *live.Info {
 
 	// 设置 NotifyOnly 状态
 	info.NotifyOnly = false
+	info.Pinned = false
 	if cfg := configs.GetCurrentConfig(); cfg != nil {
 		if room, err := cfg.GetLiveRoomByUrl(l.GetRawUrl()); err == nil {
 			info.NotifyOnly = room.NotifyOnly
+			info.Pinned = room.Pinned
 		}
 	}
 
@@ -2006,6 +2008,9 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 		if isListening, ok := updates["is_listening"].(bool); ok {
 			room.IsListening = isListening
 		}
+		if pinned, ok := updates["pinned"].(bool); ok {
+			room.Pinned = pinned
+		}
 		if quality, ok := updates["quality"].(float64); ok {
 			room.Quality = int(quality)
 		}
@@ -2068,6 +2073,13 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+
+	if pinned, ok := updates["pinned"].(bool); ok {
+		GetSSEHub().BroadcastListChange(types.LiveID(liveId), "pin_change", map[string]interface{}{
+			"live_id": string(liveId),
+			"pinned":  pinned,
+		})
 	}
 
 	writeJSON(writer, commonResp{
@@ -2289,6 +2301,9 @@ func updateRoomConfig(writer http.ResponseWriter, r *http.Request) {
 		}
 		if audioOnly, ok := updates["audio_only"].(bool); ok {
 			room.AudioOnly = audioOnly
+		}
+		if pinned, ok := updates["pinned"].(bool); ok {
+			room.Pinned = pinned
 		}
 		if notifyOnly, ok := updates["notify_only"].(bool); ok {
 			room.NotifyOnly = notifyOnly
