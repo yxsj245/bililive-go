@@ -17,6 +17,8 @@ import (
 	"github.com/bililive-go/bililive-go/src/types"
 )
 
+const concurrentOperationTimeout = time.Second
+
 func TestManagerAddAndRemoveListener(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -32,7 +34,7 @@ func TestManagerAddAndRemoveListener(t *testing.T) {
 	}
 	defer func() { newListener = backup }()
 	l := livemock.NewMockLive(ctrl)
-	l.EXPECT().GetLiveId().Return(types.LiveID("test")).Times(3)
+	l.EXPECT().GetLiveId().Return(types.LiveID("test")).Times(2)
 	assert.NoError(t, m.AddListener(context.Background(), l))
 	assert.Equal(t, ErrListenerExist, m.AddListener(context.Background(), l))
 	ln, err := m.GetListener(context.Background(), "test")
@@ -46,7 +48,7 @@ func TestManagerAddAndRemoveListener(t *testing.T) {
 	assert.False(t, m.HasListener(context.Background(), "test"))
 }
 
-func TestManagerRemoveListenerWaitsBeforeReAdd(t *testing.T) {
+func TestManagerAddListenerWaitsForSameLiveIDClosing(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -58,19 +60,19 @@ func TestManagerRemoveListenerWaitsBeforeReAdd(t *testing.T) {
 		<-releaseClose
 	})
 
-	startCalled := make(chan struct{})
 	newListenerMock := NewMockListener(ctrl)
-	newListenerMock.EXPECT().Start().DoAndReturn(func() error {
-		close(startCalled)
-		return nil
-	})
+	newListenerMock.EXPECT().Start().Return(nil)
 
 	liveMock := livemock.NewMockLive(ctrl)
 	liveMock.EXPECT().GetLiveId().Return(types.LiveID("test")).Times(2)
 
 	m := &manager{savers: map[types.LiveID]Listener{"test": oldListener}}
 	backup := newListener
-	newListener = func(context.Context, live.Live) Listener { return newListenerMock }
+	newListenerCalls := 0
+	newListener = func(context.Context, live.Live) Listener {
+		newListenerCalls++
+		return newListenerMock
+	}
 	defer func() { newListener = backup }()
 
 	removeDone := make(chan error, 1)
@@ -79,27 +81,63 @@ func TestManagerRemoveListenerWaitsBeforeReAdd(t *testing.T) {
 	}()
 	<-closeStarted
 
-	addStarted := make(chan struct{})
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, m.AddListener(canceledCtx, liveMock), context.Canceled)
+	assert.Zero(t, newListenerCalls, "旧 listener 关闭完成前不应创建新 listener")
+
+	close(releaseClose)
+	assert.NoError(t, <-removeDone)
+	assert.NoError(t, m.AddListener(context.Background(), liveMock))
+	assert.Equal(t, 1, newListenerCalls)
+}
+
+func TestManagerRemoveListenerDoesNotBlockOtherLiveID(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	oldListener := NewMockListener(ctrl)
+	oldListener.EXPECT().CloseSync().Do(func() {
+		close(closeStarted)
+		<-releaseClose
+	})
+
+	otherListener := NewMockListener(ctrl)
+	otherListener.EXPECT().Start().Return(nil)
+	otherLive := livemock.NewMockLive(ctrl)
+	otherLive.EXPECT().GetLiveId().Return(types.LiveID("other"))
+
+	m := &manager{savers: map[types.LiveID]Listener{"test": oldListener}}
+	backup := newListener
+	newListener = func(context.Context, live.Live) Listener { return otherListener }
+	defer func() { newListener = backup }()
+
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- m.RemoveListener(context.Background(), "test")
+	}()
+	<-closeStarted
+
 	addDone := make(chan error, 1)
 	go func() {
-		close(addStarted)
-		addDone <- m.AddListener(context.Background(), liveMock)
+		addDone <- m.AddListener(context.Background(), otherLive)
 	}()
-	<-addStarted
 
+	addCompleted := false
 	select {
-	case <-startCalled:
-		t.Error("new listener started before old ListenStop handlers completed")
-	case <-time.After(50 * time.Millisecond):
+	case err := <-addDone:
+		addCompleted = true
+		assert.NoError(t, err)
+	case <-time.After(concurrentOperationTimeout):
+		t.Error("关闭一个房间时阻塞了其他房间的 AddListener")
 	}
 
 	close(releaseClose)
 	assert.NoError(t, <-removeDone)
-	assert.NoError(t, <-addDone)
-	select {
-	case <-startCalled:
-	case <-time.After(time.Second):
-		t.Error("new listener did not start after old ListenStop handlers completed")
+	if !addCompleted {
+		assert.NoError(t, <-addDone)
 	}
 }
 
