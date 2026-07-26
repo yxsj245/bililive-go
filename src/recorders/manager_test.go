@@ -10,11 +10,32 @@ import (
 
 	"github.com/bililive-go/bililive-go/src/configs"
 	"github.com/bililive-go/bililive-go/src/instance"
+	"github.com/bililive-go/bililive-go/src/listeners"
 	"github.com/bililive-go/bililive-go/src/live"
 	livemock "github.com/bililive-go/bililive-go/src/live/mock"
+	"github.com/bililive-go/bililive-go/src/pkg/events"
 	"github.com/bililive-go/bililive-go/src/pkg/livelogger"
 	"github.com/bililive-go/bililive-go/src/types"
 )
+
+type testListenerEventSource struct {
+	closed bool
+}
+
+func (s *testListenerEventSource) IsClosed() bool {
+	return s.closed
+}
+
+type recorderDoneObservedContext struct {
+	context.Context
+	once     sync.Once
+	observed chan struct{}
+}
+
+func (c *recorderDoneObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
 
 func TestManagerAddAndRemoveRecorder(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -33,8 +54,8 @@ func TestManagerAddAndRemoveRecorder(t *testing.T) {
 			// 第一个 recorder 会被 RestartRecorder 调用 CloseForRestart
 			r.EXPECT().CloseForRestart().Return(nil)
 		} else {
-			// 第二个 recorder 会被 RemoveRecorder 调用 Close
-			r.EXPECT().Close()
+			// 第二个 recorder 会被 RemoveRecorder 调用 CloseAndWait
+			r.EXPECT().CloseAndWait()
 		}
 		return r, nil
 	}
@@ -54,6 +75,101 @@ func TestManagerAddAndRemoveRecorder(t *testing.T) {
 	_, err = m.GetRecorder(context.Background(), "test")
 	assert.Equal(t, ErrRecorderNotExist, err)
 	assert.False(t, m.HasRecorder(context.Background(), "test"))
+}
+
+func TestManagerIgnoresStaleRecorderEvents(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	liveMock := livemock.NewMockLive(ctrl)
+	liveMock.EXPECT().GetLiveId().Return(types.LiveID("test")).AnyTimes()
+
+	m := &manager{savers: make(map[types.LiveID]Recorder)}
+	backup := newRecorder
+	newRecorder = func(context.Context, live.Live) (Recorder, error) {
+		t.Fatal("关闭后的 listener 不应创建 recorder")
+		return nil, nil
+	}
+	defer func() { newRecorder = backup }()
+
+	closedSource := &testListenerEventSource{closed: true}
+	staleLiveStart := events.NewEventWithSource(listeners.LiveStart, liveMock, closedSource)
+	assert.NoError(t, m.addRecorder(context.Background(), liveMock, staleLiveStart))
+	assert.Empty(t, m.savers)
+
+	oldRecorder := NewMockRecorder(ctrl)
+	currentRecorder := NewMockRecorder(ctrl)
+	m.savers["test"] = currentRecorder
+	staleLiveEnd := events.NewEventWithSource(listeners.LiveEnd, liveMock, oldRecorder)
+	assert.NoError(t, m.removeRecorder(context.Background(), "test", recorderRemovalOptions{event: staleLiveEnd}))
+	assert.Same(t, currentRecorder, m.savers[types.LiveID("test")])
+}
+
+func TestManagerRecorderClosingBlocksReAddAndListenStop(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	oldRecorder := NewMockRecorder(ctrl)
+	oldRecorder.EXPECT().CloseAndWait().Do(func() {
+		close(closeStarted)
+		<-releaseClose
+	})
+
+	newRecorderMock := NewMockRecorder(ctrl)
+	newRecorderMock.EXPECT().Start(gomock.Any()).Return(nil)
+	liveMock := livemock.NewMockLive(ctrl)
+	liveMock.EXPECT().GetLiveId().Return(types.LiveID("test")).AnyTimes()
+
+	m := &manager{savers: map[types.LiveID]Recorder{"test": oldRecorder}}
+	backup := newRecorder
+	newRecorderCalls := 0
+	newRecorder = func(context.Context, live.Live) (Recorder, error) {
+		newRecorderCalls++
+		return newRecorderMock, nil
+	}
+	defer func() { newRecorder = backup }()
+
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- m.RemoveRecorder(context.Background(), "test")
+	}()
+	<-closeStarted
+
+	baseCtx, cancel := context.WithCancel(context.Background())
+	waitCtx := &recorderDoneObservedContext{Context: baseCtx, observed: make(chan struct{})}
+	addDone := make(chan error, 1)
+	go func() {
+		addDone <- m.AddRecorder(waitCtx, liveMock)
+	}()
+	<-waitCtx.observed
+	assert.Zero(t, newRecorderCalls, "旧 recorder 完全退出前不应创建新 recorder")
+	cancel()
+	assert.ErrorIs(t, <-addDone, context.Canceled)
+
+	stopBaseCtx, stopCancel := context.WithCancel(context.Background())
+	defer stopCancel()
+	stopCtx := &recorderDoneObservedContext{Context: stopBaseCtx, observed: make(chan struct{})}
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- m.removeRecorder(stopCtx, "test", recorderRemovalOptions{
+			event:               events.NewEventWithSource(listeners.ListenStop, liveMock, closedSourceForTest()),
+			allowClosedListener: true,
+			waitForClosing:      true,
+		})
+	}()
+	<-stopCtx.observed
+
+	close(releaseClose)
+	assert.NoError(t, <-removeDone)
+	assert.NoError(t, <-stopDone)
+	assert.NoError(t, m.AddRecorder(context.Background(), liveMock))
+	assert.Equal(t, 1, newRecorderCalls)
+}
+
+func closedSourceForTest() *testListenerEventSource {
+	return &testListenerEventSource{closed: true}
 }
 
 // TestRestartRecorderRaceWithLiveEnd 验证 RestartRecorder 和 LiveEnd（RemoveRecorder）
@@ -89,6 +205,7 @@ func TestRestartRecorderRaceWithLiveEnd(t *testing.T) {
 		r := NewMockRecorder(ctrl)
 		r.EXPECT().Start(gomock.Any()).Return(nil).AnyTimes()
 		r.EXPECT().Close().AnyTimes()
+		r.EXPECT().CloseAndWait().AnyTimes()
 		r.EXPECT().CloseForRestart().Return(nil).AnyTimes()
 
 		if restartPhase {

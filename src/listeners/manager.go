@@ -105,9 +105,16 @@ func (m *manager) Close(ctx context.Context) {
 }
 
 func (m *manager) AddListener(ctx context.Context, live live.Live) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	liveID := live.GetLiveId()
 	for {
 		m.lock.Lock()
+		if err := ctx.Err(); err != nil {
+			m.lock.Unlock()
+			return err
+		}
 		if done, ok := m.closing[liveID]; ok {
 			m.lock.Unlock()
 			select {

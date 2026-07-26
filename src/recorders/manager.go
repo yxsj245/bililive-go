@@ -52,6 +52,7 @@ func SetBroadcastDanmakuFunc(fn BroadcastDanmakuFunc) {
 func NewManager(ctx context.Context) Manager {
 	rm := &manager{
 		savers:       make(map[types.LiveID]Recorder),
+		closing:      make(map[types.LiveID]chan struct{}),
 		statusStopCh: make(chan struct{}),
 	}
 	instance.GetInstance(ctx).RecorderManager = rm
@@ -83,6 +84,7 @@ var (
 type manager struct {
 	lock         sync.RWMutex
 	savers       map[types.LiveID]Recorder
+	closing      map[types.LiveID]chan struct{}
 	statusTicker *time.Ticker
 	statusStopCh chan struct{}
 	statusWg     sync.WaitGroup // 用于等待广播 goroutine 退出
@@ -93,6 +95,24 @@ type manager struct {
 	// 会误判为"无活跃录制"导致优雅更新被提前触发。
 	// 通过 restartingCount 将收尾中的旧 recorder 也计入活跃数量。
 	restartingCount atomic.Int32
+}
+
+type recorderRemovalOptions struct {
+	event               *events.Event
+	allowClosedListener bool
+	waitForClosing      bool
+}
+
+type listenerEventSource interface {
+	IsClosed() bool
+}
+
+func eventFromClosedListener(event *events.Event) bool {
+	if event == nil {
+		return false
+	}
+	source, ok := event.Source.(listenerEventSource)
+	return ok && source.IsClosed()
 }
 
 func (m *manager) registryListener(ctx context.Context, ed events.Dispatcher) {
@@ -107,13 +127,16 @@ func (m *manager) registryListener(ctx context.Context, ed events.Dispatcher) {
 			}
 		}
 
-		if err := m.AddRecorder(ctx, live); err != nil {
+		if err := m.addRecorder(ctx, live, event); err != nil {
 			live.GetLogger().Errorf("failed to add recorder, err: %v", err)
 		}
 	}))
 
 	ed.AddEventListener(listeners.RoomNameChanged, events.NewEventListener(func(event *events.Event) {
 		live := event.Object.(live.Live)
+		if eventFromClosedListener(event) {
+			return
+		}
 		if !m.HasRecorder(ctx, live.GetLiveId()) {
 			return
 		}
@@ -122,17 +145,23 @@ func (m *manager) registryListener(ctx context.Context, ed events.Dispatcher) {
 		}
 	}))
 
-	removeEvtListener := events.NewEventListener(func(event *events.Event) {
+	ed.AddEventListener(listeners.LiveEnd, events.NewEventListener(func(event *events.Event) {
 		live := event.Object.(live.Live)
-		if !m.HasRecorder(ctx, live.GetLiveId()) {
-			return
-		}
-		if err := m.RemoveRecorder(ctx, live.GetLiveId()); err != nil {
+		if err := m.removeRecorder(ctx, live.GetLiveId(), recorderRemovalOptions{event: event}); err != nil {
 			live.GetLogger().Errorf("failed to remove recorder, err: %v", err)
 		}
-	})
-	ed.AddEventListener(listeners.LiveEnd, removeEvtListener)
-	ed.AddEventListener(listeners.ListenStop, removeEvtListener)
+	}))
+
+	ed.AddEventListener(listeners.ListenStop, events.NewEventListener(func(event *events.Event) {
+		live := event.Object.(live.Live)
+		if err := m.removeRecorder(ctx, live.GetLiveId(), recorderRemovalOptions{
+			event:               event,
+			allowClosedListener: true,
+			waitForClosing:      true,
+		}); err != nil {
+			live.GetLogger().Errorf("failed to remove recorder, err: %v", err)
+		}
+	}))
 }
 
 func (m *manager) Start(ctx context.Context) error {
@@ -170,9 +199,37 @@ func (m *manager) Close(ctx context.Context) {
 }
 
 func (m *manager) AddRecorder(ctx context.Context, live live.Live) error {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	return m.addRecorderLocked(ctx, live)
+	return m.addRecorder(ctx, live, nil)
+}
+
+func (m *manager) addRecorder(ctx context.Context, live live.Live, event *events.Event) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	liveID := live.GetLiveId()
+	for {
+		m.lock.Lock()
+		if err := ctx.Err(); err != nil {
+			m.lock.Unlock()
+			return err
+		}
+		if eventFromClosedListener(event) {
+			m.lock.Unlock()
+			return nil
+		}
+		if done, ok := m.closing[liveID]; ok {
+			m.lock.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		err := m.addRecorderLocked(ctx, live)
+		m.lock.Unlock()
+		return err
+	}
 }
 
 // addRecorderLocked 是 AddRecorder 的内部实现，调用者必须已持有 m.lock
@@ -278,19 +335,65 @@ func (m *manager) RestartRecorder(ctx context.Context, live live.Live) error {
 }
 
 func (m *manager) RemoveRecorder(ctx context.Context, liveId types.LiveID) error {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	return m.removeRecorderLocked(ctx, liveId)
+	return m.removeRecorder(ctx, liveId, recorderRemovalOptions{})
 }
 
-// removeRecorderLocked 是 RemoveRecorder 的内部实现，调用者必须已持有 m.lock
-func (m *manager) removeRecorderLocked(ctx context.Context, liveId types.LiveID) error {
-	recorder, ok := m.savers[liveId]
-	if !ok {
+func (m *manager) removeRecorder(ctx context.Context, liveId types.LiveID, opts recorderRemovalOptions) error {
+	m.lock.Lock()
+	if !opts.allowClosedListener && eventFromClosedListener(opts.event) {
+		m.lock.Unlock()
+		return nil
+	}
+	if done, ok := m.closing[liveId]; ok {
+		m.lock.Unlock()
+		if opts.waitForClosing {
+			select {
+			case <-done:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if opts.event != nil {
+			return nil
+		}
 		return ErrRecorderNotExist
 	}
-	recorder.Close()
+
+	recorder, ok := m.savers[liveId]
+	if !ok {
+		m.lock.Unlock()
+		if opts.event != nil {
+			return nil
+		}
+		return ErrRecorderNotExist
+	}
+	if opts.event != nil {
+		if source, ok := opts.event.Source.(Recorder); ok && source != recorder {
+			m.lock.Unlock()
+			return nil
+		}
+	}
+	if m.closing == nil {
+		m.closing = make(map[types.LiveID]chan struct{})
+	}
+	done := make(chan struct{})
+	m.closing[liveId] = done
 	delete(m.savers, liveId)
+	m.lock.Unlock()
+
+	var finishOnce sync.Once
+	finishClosing := func() {
+		finishOnce.Do(func() {
+			m.lock.Lock()
+			delete(m.closing, liveId)
+			close(done)
+			m.lock.Unlock()
+		})
+	}
+	defer finishClosing()
+	recorder.CloseAndWait()
+	finishClosing()
 
 	// 录制结束后，检查是否有等待中的优雅更新
 	if onRecordingEndFunc != nil {
@@ -382,9 +485,9 @@ func (m *manager) GetRecorderStatus(ctx context.Context, liveId types.LiveID) (m
 }
 
 // GetActiveRecordingsCount 获取当前活跃的录制数量
-// 包含 map 中的录制器和正在执行 CloseForRestart 收尾的旧录制器
+// 包含 map 中的录制器、正在关闭的录制器和执行 CloseForRestart 收尾的旧录制器
 func (m *manager) GetActiveRecordingsCount() int {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
-	return len(m.savers) + int(m.restartingCount.Load())
+	return len(m.savers) + len(m.closing) + int(m.restartingCount.Load())
 }

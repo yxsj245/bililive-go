@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/bluele/gcache"
@@ -13,8 +14,42 @@ import (
 	"github.com/bililive-go/bililive-go/src/configs"
 	"github.com/bililive-go/bililive-go/src/live"
 	livemock "github.com/bililive-go/bililive-go/src/live/mock"
+	"github.com/bililive-go/bililive-go/src/pkg/events"
+	evtmock "github.com/bililive-go/bililive-go/src/pkg/events/mock"
 	"github.com/bililive-go/bililive-go/src/pkg/livelogger"
 )
+
+func TestRecorderCloseAndWaitWaitsForRunExit(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	liveMock := livemock.NewMockLive(ctrl)
+	ed := evtmock.NewMockDispatcher(ctrl)
+	liveMock.EXPECT().GetLogger().Return(livelogger.New(0, nil))
+	ed.EXPECT().DispatchEvent(events.NewEvent(RecorderStop, liveMock))
+
+	r := &recorder{
+		Live:       liveMock,
+		ed:         ed,
+		state:      running,
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
+		parserLock: new(sync.RWMutex),
+	}
+	closeReturned := make(chan struct{})
+	go func() {
+		r.CloseAndWait()
+		close(closeReturned)
+	}()
+
+	<-r.stop
+	select {
+	case <-closeReturned:
+		t.Fatal("run 退出前 CloseAndWait 不应返回")
+	default:
+	}
+
+	close(r.done)
+	<-closeReturned
+}
 
 func TestTryRecordStopsWithoutPanicWhenFilenameRenderFails(t *testing.T) {
 	previousConfig := configs.GetCurrentConfig()

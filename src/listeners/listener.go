@@ -72,7 +72,7 @@ func (l *listener) start(initialInfo *live.Info) error {
 	}
 	defer atomic.CompareAndSwapUint32(&l.state, pending, running)
 
-	l.ed.DispatchEvent(events.NewEvent(ListenStart, l.Live))
+	l.ed.DispatchEvent(events.NewEventWithSource(ListenStart, l.Live, l))
 
 	// 首次信息获取放到后台执行。调用方 manager.AddListener 全程持有管理器的全局锁，
 	// 而 refresh 是一次真实的网络请求，还要排队等待平台访问频率限制；
@@ -100,6 +100,11 @@ func (l *listener) isStopped() bool {
 	}
 }
 
+// IsClosed 供事件处理器判断事件是否来自已经关闭的 listener 实例。
+func (l *listener) IsClosed() bool {
+	return l.isStopped()
+}
+
 func (l *listener) Close() {
 	l.close(false)
 }
@@ -116,7 +121,7 @@ func (l *listener) close(syncEvent bool) {
 	}
 	l.runCancel() // 先取消等待并标记停止，禁止并发请求结果继续发布事件
 	close(l.stop)
-	event := events.NewEvent(ListenStop, l.Live)
+	event := events.NewEventWithSource(ListenStop, l.Live, l)
 	if syncEvent {
 		l.ed.DispatchEventSync(event)
 	} else {
@@ -244,7 +249,7 @@ func (l *listener) processInfo(info *live.Info) {
 		logInfo = "Room name was changed"
 	}
 	if isStatusChanged {
-		l.ed.DispatchEvent(events.NewEvent(evtTyp, l.Live))
+		l.ed.DispatchEvent(events.NewEventWithSource(evtTyp, l.Live, l))
 		applog.GetLogger().WithFields(fields).Info(logInfo)
 	}
 }

@@ -3,6 +3,7 @@ package listeners
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,17 @@ import (
 )
 
 const concurrentOperationTimeout = time.Second
+
+type doneObservedContext struct {
+	context.Context
+	once     sync.Once
+	observed chan struct{}
+}
+
+func (c *doneObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
 
 func TestManagerAddAndRemoveListener(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -46,6 +58,23 @@ func TestManagerAddAndRemoveListener(t *testing.T) {
 	_, err = m.GetListener(context.Background(), "test")
 	assert.Equal(t, ErrListenerNotExist, err)
 	assert.False(t, m.HasListener(context.Background(), "test"))
+}
+
+func TestManagerAddListenerRejectsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	m := &manager{savers: make(map[types.LiveID]Listener)}
+	liveMock := livemock.NewMockLive(gomock.NewController(t))
+	backup := newListener
+	newListener = func(context.Context, live.Live) Listener {
+		t.Fatal("context 已取消时不应创建 listener")
+		return nil
+	}
+	defer func() { newListener = backup }()
+
+	assert.ErrorIs(t, m.AddListener(ctx, liveMock), context.Canceled)
+	assert.Empty(t, m.savers)
 }
 
 func TestManagerAddListenerWaitsForSameLiveIDClosing(t *testing.T) {
@@ -81,10 +110,16 @@ func TestManagerAddListenerWaitsForSameLiveIDClosing(t *testing.T) {
 	}()
 	<-closeStarted
 
-	canceledCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-	assert.ErrorIs(t, m.AddListener(canceledCtx, liveMock), context.Canceled)
+	baseCtx, cancel := context.WithCancel(context.Background())
+	waitCtx := &doneObservedContext{Context: baseCtx, observed: make(chan struct{})}
+	addDone := make(chan error, 1)
+	go func() {
+		addDone <- m.AddListener(waitCtx, liveMock)
+	}()
+	<-waitCtx.observed
 	assert.Zero(t, newListenerCalls, "旧 listener 关闭完成前不应创建新 listener")
+	cancel()
+	assert.ErrorIs(t, <-addDone, context.Canceled)
 
 	close(releaseClose)
 	assert.NoError(t, <-removeDone)

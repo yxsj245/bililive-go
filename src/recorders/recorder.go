@@ -227,6 +227,8 @@ type Recorder interface {
 	StartTime() time.Time
 	GetStatus() (map[string]interface{}, error)
 	Close()
+	// CloseAndWait 关闭 recorder，并等待 run 与全部文件后处理完成。
+	CloseAndWait()
 	// GetParserPID 获取当前 parser 进程的 PID
 	// 如果 parser 未启动或不支持 PID 获取，返回 0
 	GetParserPID() int
@@ -848,7 +850,7 @@ func (r *recorder) stopRetryForExplicitOffline(err error) bool {
 		return false
 	}
 	r.getLogger().WithError(err).Info("stream source explicitly reported offline, dispatching LiveEnd")
-	r.ed.DispatchEvent(events.NewEvent(listeners.LiveEnd, r.Live))
+	r.ed.DispatchEvent(events.NewEventWithSource(listeners.LiveEnd, r.Live, r))
 	return true
 }
 
@@ -1114,12 +1116,16 @@ func (r *recorder) Close() {
 	r.ed.DispatchEvent(events.NewEvent(RecorderStop, r.Live))
 }
 
+func (r *recorder) CloseAndWait() {
+	r.Close()
+	<-r.done
+}
+
 func (r *recorder) CloseForRestart() []notify.RecordingFileDetail {
 	r.recordedFilesMu.Lock()
 	r.suppressSummary = true
 	r.recordedFilesMu.Unlock()
-	r.Close()
-	<-r.done // 等待 run() 完全退出，确保最后一个文件已累积
+	r.CloseAndWait()
 	r.recordedFilesMu.Lock()
 	defer r.recordedFilesMu.Unlock()
 	r.getLogger().Infof("分段重启：携带 %d 个累积文件传递给新 recorder", len(r.recordedFiles))
