@@ -121,7 +121,10 @@ func (m *manager) RemoveListener(ctx context.Context, liveId types.LiveID) error
 	if !ok {
 		return ErrListenerNotExist
 	}
-	listener.Close()
+	// 在持有 manager 锁期间同步清理旧 listener 的录制器。这样紧随其后的
+	// AddListener 必须等 ListenStop 处理完成后才能发布新的 LiveStart，避免
+	// 旧停止事件误删刚创建的录制器。
+	listener.CloseSync()
 	delete(m.savers, liveId)
 	return nil
 }

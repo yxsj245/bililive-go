@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	gomock "go.uber.org/mock/gomock"
@@ -26,7 +27,7 @@ func TestManagerAddAndRemoveListener(t *testing.T) {
 	newListener = func(ctx context.Context, live live.Live) Listener {
 		ln := NewMockListener(ctrl)
 		ln.EXPECT().Start().Return(nil)
-		ln.EXPECT().Close()
+		ln.EXPECT().CloseSync()
 		return ln
 	}
 	defer func() { newListener = backup }()
@@ -43,6 +44,63 @@ func TestManagerAddAndRemoveListener(t *testing.T) {
 	_, err = m.GetListener(context.Background(), "test")
 	assert.Equal(t, ErrListenerNotExist, err)
 	assert.False(t, m.HasListener(context.Background(), "test"))
+}
+
+func TestManagerRemoveListenerWaitsBeforeReAdd(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	closeStarted := make(chan struct{})
+	releaseClose := make(chan struct{})
+	oldListener := NewMockListener(ctrl)
+	oldListener.EXPECT().CloseSync().Do(func() {
+		close(closeStarted)
+		<-releaseClose
+	})
+
+	startCalled := make(chan struct{})
+	newListenerMock := NewMockListener(ctrl)
+	newListenerMock.EXPECT().Start().DoAndReturn(func() error {
+		close(startCalled)
+		return nil
+	})
+
+	liveMock := livemock.NewMockLive(ctrl)
+	liveMock.EXPECT().GetLiveId().Return(types.LiveID("test")).Times(2)
+
+	m := &manager{savers: map[types.LiveID]Listener{"test": oldListener}}
+	backup := newListener
+	newListener = func(context.Context, live.Live) Listener { return newListenerMock }
+	defer func() { newListener = backup }()
+
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- m.RemoveListener(context.Background(), "test")
+	}()
+	<-closeStarted
+
+	addStarted := make(chan struct{})
+	addDone := make(chan error, 1)
+	go func() {
+		close(addStarted)
+		addDone <- m.AddListener(context.Background(), liveMock)
+	}()
+	<-addStarted
+
+	select {
+	case <-startCalled:
+		t.Error("new listener started before old ListenStop handlers completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseClose)
+	assert.NoError(t, <-removeDone)
+	assert.NoError(t, <-addDone)
+	select {
+	case <-startCalled:
+	case <-time.After(time.Second):
+		t.Error("new listener did not start after old ListenStop handlers completed")
+	}
 }
 
 func TestManagerStartAndClose(t *testing.T) {

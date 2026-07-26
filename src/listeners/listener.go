@@ -104,8 +104,8 @@ func (l *listener) Close() {
 	l.close(false)
 }
 
-// CloseSync 同步完成 ListenStop 的所有处理器，仅用于初始化 listener 的交接路径。
-// 普通关闭仍保持异步，避免改变其他调用方的延迟语义。
+// CloseSync 同步完成 ListenStop 的所有处理器，用于调用方必须等待下游状态清理
+// 完成后才能继续的 listener 交接路径。
 func (l *listener) CloseSync() {
 	l.close(true)
 }
