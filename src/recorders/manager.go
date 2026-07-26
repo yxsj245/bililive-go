@@ -197,7 +197,18 @@ func (m *manager) Close(ctx context.Context) {
 }
 
 func (m *manager) AddRecorder(ctx context.Context, live live.Live) error {
-	return m.addRecorder(ctx, live, nil)
+	// 直接录制（包括 NotifyOnly 房间）仍可能存在 listener。记录当前 listener
+	// 后，房间改名事件可以重启该 recorder，同时旧 listener 的迟到事件仍会
+	// 被 restartRecorder 的来源身份校验拒绝。
+	var event *events.Event
+	if inst := instance.GetInstance(ctx); inst != nil && inst.ListenerManager != nil {
+		if listenerManager, ok := inst.ListenerManager.(listeners.Manager); ok {
+			if source, err := listenerManager.GetListener(ctx, live.GetLiveId()); err == nil {
+				event = events.NewEventWithSource(listeners.LiveStart, live, source)
+			}
+		}
+	}
+	return m.addRecorder(ctx, live, event)
 }
 
 func (m *manager) addRecorder(ctx context.Context, live live.Live, event *events.Event) error {

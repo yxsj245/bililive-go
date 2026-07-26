@@ -22,8 +22,53 @@ type testListenerEventSource struct {
 	closed bool
 }
 
+func (s *testListenerEventSource) Start() error {
+	return nil
+}
+
+func (s *testListenerEventSource) StartWithInfo(*live.Info) error {
+	return nil
+}
+
+func (s *testListenerEventSource) Close() {
+	s.closed = true
+}
+
+func (s *testListenerEventSource) CloseSync() {
+	s.closed = true
+}
+
 func (s *testListenerEventSource) IsClosed() bool {
 	return s.closed
+}
+
+type testCurrentListenerManager struct {
+	listener listeners.Listener
+}
+
+func (m *testCurrentListenerManager) Start(context.Context) error {
+	return nil
+}
+
+func (m *testCurrentListenerManager) Close(context.Context) {}
+
+func (m *testCurrentListenerManager) AddListener(context.Context, live.Live) error {
+	return nil
+}
+
+func (m *testCurrentListenerManager) RemoveListener(context.Context, types.LiveID) error {
+	return nil
+}
+
+func (m *testCurrentListenerManager) GetListener(context.Context, types.LiveID) (listeners.Listener, error) {
+	if m.listener == nil {
+		return nil, listeners.ErrListenerNotExist
+	}
+	return m.listener, nil
+}
+
+func (m *testCurrentListenerManager) HasListener(context.Context, types.LiveID) bool {
+	return m.listener != nil
 }
 
 type recorderDoneObservedContext struct {
@@ -192,6 +237,48 @@ func TestManagerRejectsLateRoomNameChangedFromOldListener(t *testing.T) {
 
 	assert.NoError(t, m.restartRecorder(context.Background(), liveMock, oldListener))
 	assert.Same(t, currentRecorder, m.savers[types.LiveID("test")])
+}
+
+func TestManagerDirectRecorderUsesCurrentListenerSource(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	configs.SetCurrentConfig(new(configs.Config))
+	listenerSource := &testListenerEventSource{}
+	inst := &instance.Instance{
+		ListenerManager: &testCurrentListenerManager{listener: listenerSource},
+	}
+	ctx := context.WithValue(context.Background(), instance.Key, inst)
+	m := NewManager(ctx).(*manager)
+
+	liveMock := livemock.NewMockLive(ctrl)
+	liveMock.EXPECT().GetLiveId().Return(types.LiveID("test")).AnyTimes()
+	liveMock.EXPECT().GetLogger().Return(livelogger.New(0, nil)).AnyTimes()
+
+	oldRecorder := NewMockRecorder(ctrl)
+	oldRecorder.EXPECT().Start(ctx).Return(nil)
+	oldRecorder.EXPECT().CloseForRestart().Return(nil)
+	newRecorderMock := NewMockRecorder(ctrl)
+	newRecorderMock.EXPECT().Start(ctx).Return(nil)
+
+	backup := newRecorder
+	callCount := 0
+	newRecorder = func(context.Context, live.Live) (Recorder, error) {
+		callCount++
+		if callCount == 1 {
+			return oldRecorder, nil
+		}
+		return newRecorderMock, nil
+	}
+	defer func() { newRecorder = backup }()
+
+	assert.NoError(t, m.AddRecorder(ctx, liveMock))
+	assert.Same(t, listenerSource, m.sources[types.LiveID("test")])
+
+	// 当前 listener 的改名事件必须能够通过来源校验并重启直接录制器。
+	assert.NoError(t, m.restartRecorder(ctx, liveMock, listenerSource))
+	assert.Same(t, newRecorderMock, m.savers[types.LiveID("test")])
+	assert.Same(t, listenerSource, m.sources[types.LiveID("test")])
 }
 
 func closedSourceForTest() *testListenerEventSource {
