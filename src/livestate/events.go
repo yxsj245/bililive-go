@@ -22,6 +22,9 @@ func RegisterEventListeners(ed events.Dispatcher, manager *Manager, cache gcache
 
 	// 监听直播开始事件
 	ed.AddEventListener(listeners.LiveStart, events.NewEventListener(func(event *events.Event) {
+		if events.SourceClosed(event) {
+			return
+		}
 		l, ok := event.Object.(live.Live)
 		if !ok {
 			return
@@ -49,6 +52,9 @@ func RegisterEventListeners(ed events.Dispatcher, manager *Manager, cache gcache
 
 	// 监听直播结束事件
 	ed.AddEventListener(listeners.LiveEnd, events.NewEventListener(func(event *events.Event) {
+		if events.SourceClosed(event) {
+			return
+		}
 		l, ok := event.Object.(live.Live)
 		if !ok {
 			return

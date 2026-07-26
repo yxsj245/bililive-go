@@ -9,6 +9,7 @@ import (
 
 	"github.com/bluele/gcache"
 	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 	gomock "go.uber.org/mock/gomock"
 
 	"github.com/bililive-go/bililive-go/src/configs"
@@ -49,6 +50,28 @@ func TestRecorderCloseAndWaitWaitsForRunExit(t *testing.T) {
 
 	close(r.done)
 	<-closeReturned
+}
+
+type parserInstalledAfterClose struct {
+	stopped bool
+}
+
+func (p *parserInstalledAfterClose) ParseLiveStream(context.Context, *live.StreamUrlInfo, live.Live, string) error {
+	return nil
+}
+
+func (p *parserInstalledAfterClose) Stop() error {
+	p.stopped = true
+	return nil
+}
+
+func TestRecorderRejectsParserInstalledAfterClose(t *testing.T) {
+	r := &recorder{state: stopped, parserLock: new(sync.RWMutex)}
+	p := &parserInstalledAfterClose{}
+
+	assert.False(t, r.setAndCloseParser(p))
+	assert.True(t, p.stopped, "关闭后的新 parser 应立即停止")
+	assert.Nil(t, r.getParser())
 }
 
 func TestTryRecordStopsWithoutPanicWhenFilenameRenderFails(t *testing.T) {

@@ -581,7 +581,9 @@ func (r *recorder) tryRecord(ctx context.Context) {
 		r.getLogger().WithError(err).Error("failed to init parse")
 		return
 	}
-	r.setAndCloseParser(p)
+	if !r.setAndCloseParser(p) {
+		return
+	}
 	r.startTime = time.Now()
 
 	// 弹幕录制（支持哔哩哔哩、抖音、斗鱼平台）
@@ -1054,15 +1056,25 @@ func (r *recorder) getParser() parser.Parser {
 	return r.parser
 }
 
-func (r *recorder) setAndCloseParser(p parser.Parser) {
+// setAndCloseParser 安装新的 parser；若录制器已关闭则立即停止它并返回 false。
+// 这避免 Close 与 tryRecord 并发时，Close 先观察到 parser 为 nil，随后 tryRecord
+// 又安装无法被停止的新 parser。
+func (r *recorder) setAndCloseParser(p parser.Parser) bool {
 	r.parserLock.Lock()
 	defer r.parserLock.Unlock()
+	if atomic.LoadUint32(&r.state) == stopped {
+		if err := p.Stop(); err != nil {
+			r.getLogger().WithError(err).Warn("failed to end recorder")
+		}
+		return false
+	}
 	if r.parser != nil {
 		if err := r.parser.Stop(); err != nil {
 			r.getLogger().WithError(err).Warn("failed to end recorder")
 		}
 	}
 	r.parser = p
+	return true
 }
 
 func (r *recorder) Start(ctx context.Context) error {

@@ -53,6 +53,7 @@ func NewManager(ctx context.Context) Manager {
 	rm := &manager{
 		savers:       make(map[types.LiveID]Recorder),
 		closing:      make(map[types.LiveID]chan struct{}),
+		sources:      make(map[types.LiveID]any),
 		statusStopCh: make(chan struct{}),
 	}
 	instance.GetInstance(ctx).RecorderManager = rm
@@ -82,9 +83,14 @@ var (
 )
 
 type manager struct {
-	lock         sync.RWMutex
-	savers       map[types.LiveID]Recorder
-	closing      map[types.LiveID]chan struct{}
+	lock    sync.RWMutex
+	savers  map[types.LiveID]Recorder
+	closing map[types.LiveID]chan struct{}
+	// sources 记录创建各录制器的 listener 实例，用于拒绝旧 listener 的迟到事件。
+	sources map[types.LiveID]any
+	// waitingAdds 记录正在等待关闭屏障的重新添加操作。
+	// 与 closing 一起计入活跃录制数，避免优雅更新在交接间隙被触发。
+	waitingAdds  int
 	statusTicker *time.Ticker
 	statusStopCh chan struct{}
 	statusWg     sync.WaitGroup // 用于等待广播 goroutine 退出
@@ -103,16 +109,8 @@ type recorderRemovalOptions struct {
 	waitForClosing      bool
 }
 
-type listenerEventSource interface {
-	IsClosed() bool
-}
-
 func eventFromClosedListener(event *events.Event) bool {
-	if event == nil {
-		return false
-	}
-	source, ok := event.Source.(listenerEventSource)
-	return ok && source.IsClosed()
+	return events.SourceClosed(event)
 }
 
 func (m *manager) registryListener(ctx context.Context, ed events.Dispatcher) {
@@ -140,7 +138,7 @@ func (m *manager) registryListener(ctx context.Context, ed events.Dispatcher) {
 		if !m.HasRecorder(ctx, live.GetLiveId()) {
 			return
 		}
-		if err := m.RestartRecorder(ctx, live); err != nil {
+		if err := m.restartRecorder(ctx, live, event.Source); err != nil {
 			live.GetLogger().Errorf("failed to cronRestart recorder, err: %v", err)
 		}
 	}))
@@ -207,8 +205,16 @@ func (m *manager) addRecorder(ctx context.Context, live live.Live, event *events
 		return err
 	}
 	liveID := live.GetLiveId()
+	var source any
+	if event != nil {
+		source = event.Source
+	}
+	waitingForClosing := false
 	for {
 		m.lock.Lock()
+		if waitingForClosing {
+			m.waitingAdds--
+		}
 		if err := ctx.Err(); err != nil {
 			m.lock.Unlock()
 			return err
@@ -218,22 +224,27 @@ func (m *manager) addRecorder(ctx context.Context, live live.Live, event *events
 			return nil
 		}
 		if done, ok := m.closing[liveID]; ok {
+			m.waitingAdds++
+			waitingForClosing = true
 			m.lock.Unlock()
 			select {
 			case <-done:
 				continue
 			case <-ctx.Done():
+				m.lock.Lock()
+				m.waitingAdds--
+				m.lock.Unlock()
 				return ctx.Err()
 			}
 		}
-		err := m.addRecorderLocked(ctx, live)
+		err := m.addRecorderLocked(ctx, live, source)
 		m.lock.Unlock()
 		return err
 	}
 }
 
 // addRecorderLocked 是 AddRecorder 的内部实现，调用者必须已持有 m.lock
-func (m *manager) addRecorderLocked(ctx context.Context, live live.Live) error {
+func (m *manager) addRecorderLocked(ctx context.Context, live live.Live, source any) error {
 	if _, ok := m.savers[live.GetLiveId()]; ok {
 		return ErrRecorderExist
 	}
@@ -242,6 +253,10 @@ func (m *manager) addRecorderLocked(ctx context.Context, live live.Live) error {
 		return err
 	}
 	m.savers[live.GetLiveId()] = recorder
+	if m.sources == nil {
+		m.sources = make(map[types.LiveID]any)
+	}
+	m.sources[live.GetLiveId()] = source
 
 	cfg := configs.GetCurrentConfig()
 	if cfg != nil {
@@ -254,6 +269,7 @@ func (m *manager) addRecorderLocked(ctx context.Context, live live.Live) error {
 		// 使用异步 Close 避免在持锁时执行耗时操作（如等待 ffmpeg 进程退出），
 		// 防止长时间阻塞其他 manager 操作
 		delete(m.savers, live.GetLiveId())
+		delete(m.sources, live.GetLiveId())
 		bilisentry.Go(recorder.Close)
 		return err
 	}
@@ -281,6 +297,12 @@ func (m *manager) cronRestart(ctx context.Context, live live.Live) {
 }
 
 func (m *manager) RestartRecorder(ctx context.Context, live live.Live) error {
+	return m.restartRecorder(ctx, live, nil)
+}
+
+// restartRecorder 在锁内重验触发事件的 listener 身份，防止旧 listener
+// 已通过关闭检查、但在新实例建立后才继续执行的迟到事件重启新 recorder。
+func (m *manager) restartRecorder(ctx context.Context, live live.Live, expectedSource any) error {
 	// 1. 在锁内完成 map 操作：取出旧 recorder，创建并放入新 recorder
 	// 这样外部观察者（如 LiveEnd 事件处理器）始终能看到录制器存在，不会出现中间状态
 	m.lock.Lock()
@@ -289,11 +311,18 @@ func (m *manager) RestartRecorder(ctx context.Context, live live.Live) error {
 		m.lock.Unlock()
 		return ErrRecorderNotExist
 	}
+	if expectedSource != nil && m.sources[live.GetLiveId()] != expectedSource {
+		m.lock.Unlock()
+		return nil
+	}
+	oldSource := m.sources[live.GetLiveId()]
 	// 从 map 中移除旧 recorder 并立即添加新 recorder，保持锁贯穿整个替换操作
 	delete(m.savers, live.GetLiveId())
-	if err := m.addRecorderLocked(ctx, live); err != nil {
+	delete(m.sources, live.GetLiveId())
+	if err := m.addRecorderLocked(ctx, live, oldSource); err != nil {
 		// 添加新 recorder 失败，恢复旧 recorder 避免僵尸状态
 		m.savers[live.GetLiveId()] = oldRecorder
+		m.sources[live.GetLiveId()] = oldSource
 		m.lock.Unlock()
 		return err
 	}
@@ -380,6 +409,7 @@ func (m *manager) removeRecorder(ctx context.Context, liveId types.LiveID, opts 
 	done := make(chan struct{})
 	m.closing[liveId] = done
 	delete(m.savers, liveId)
+	delete(m.sources, liveId)
 	m.lock.Unlock()
 
 	var finishOnce sync.Once
@@ -485,9 +515,10 @@ func (m *manager) GetRecorderStatus(ctx context.Context, liveId types.LiveID) (m
 }
 
 // GetActiveRecordingsCount 获取当前活跃的录制数量
-// 包含 map 中的录制器、正在关闭的录制器和执行 CloseForRestart 收尾的旧录制器
+// 包含 map 中的录制器、正在关闭的录制器、等待关闭屏障的重新添加操作，
+// 以及执行 CloseForRestart 收尾的旧录制器。
 func (m *manager) GetActiveRecordingsCount() int {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
-	return len(m.savers) + len(m.closing) + int(m.restartingCount.Load())
+	return len(m.savers) + len(m.closing) + m.waitingAdds + int(m.restartingCount.Load())
 }

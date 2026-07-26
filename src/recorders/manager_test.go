@@ -145,6 +145,7 @@ func TestManagerRecorderClosingBlocksReAddAndListenStop(t *testing.T) {
 	}()
 	<-waitCtx.observed
 	assert.Zero(t, newRecorderCalls, "旧 recorder 完全退出前不应创建新 recorder")
+	assert.Equal(t, 2, m.GetActiveRecordingsCount(), "关闭屏障和等待重建的 recorder 都应阻止优雅更新")
 	cancel()
 	assert.ErrorIs(t, <-addDone, context.Canceled)
 
@@ -166,6 +167,31 @@ func TestManagerRecorderClosingBlocksReAddAndListenStop(t *testing.T) {
 	assert.NoError(t, <-stopDone)
 	assert.NoError(t, m.AddRecorder(context.Background(), liveMock))
 	assert.Equal(t, 1, newRecorderCalls)
+}
+
+func TestManagerRejectsLateRoomNameChangedFromOldListener(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	liveMock := livemock.NewMockLive(ctrl)
+	liveMock.EXPECT().GetLiveId().Return(types.LiveID("test")).AnyTimes()
+	oldListener := &testListenerEventSource{}
+	newListener := &testListenerEventSource{}
+	currentRecorder := NewMockRecorder(ctrl)
+	m := &manager{
+		savers:  map[types.LiveID]Recorder{"test": currentRecorder},
+		sources: map[types.LiveID]any{"test": newListener},
+	}
+
+	backup := newRecorder
+	newRecorder = func(context.Context, live.Live) (Recorder, error) {
+		t.Fatal("旧 listener 的迟到事件不应重启新 recorder")
+		return nil, nil
+	}
+	defer func() { newRecorder = backup }()
+
+	assert.NoError(t, m.restartRecorder(context.Background(), liveMock, oldListener))
+	assert.Same(t, currentRecorder, m.savers[types.LiveID("test")])
 }
 
 func closedSourceForTest() *testListenerEventSource {
