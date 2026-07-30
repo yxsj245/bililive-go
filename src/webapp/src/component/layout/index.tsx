@@ -1,5 +1,5 @@
 import React from 'react';
-import { HashRouter as Router, Link } from 'react-router-dom';
+import { HashRouter as Router, Link, useLocation } from 'react-router-dom';
 import { Layout, Menu, Button } from 'antd';
 import {
     MonitorOutlined,
@@ -28,14 +28,12 @@ interface Props {
 
 interface State {
     collapsed: boolean;
-    selectedKey: string;
 }
 
 // localStorage key 用于保存侧边栏收起状态
 const SIDER_COLLAPSED_KEY = 'siderCollapsed';
 
-const getSelectedMenuKey = (): string => {
-    const path = window.location.hash.replace(/^#/, '') || '/';
+const getSelectedMenuKey = (path: string): string => {
     if (path.startsWith('/liveInfo')) return '2';
     if (path.startsWith('/configInfo')) return '3';
     if (path.startsWith('/danmaku')) return 'danmaku';
@@ -47,8 +45,12 @@ const getSelectedMenuKey = (): string => {
     return '1';
 };
 
-class RootLayout extends React.Component<Props, State> {
-    constructor(props: Props) {
+interface RootLayoutContentProps extends Props {
+    selectedKey: string;
+}
+
+class RootLayoutContent extends React.Component<RootLayoutContentProps, State> {
+    constructor(props: RootLayoutContentProps) {
         super(props);
         // 从 localStorage 读取收起状态
         let collapsed = false;
@@ -60,20 +62,8 @@ class RootLayout extends React.Component<Props, State> {
         } catch (e) {
             console.error('读取侧边栏状态失败:', e);
         }
-        this.state = { collapsed, selectedKey: getSelectedMenuKey() };
+        this.state = { collapsed };
     }
-
-    componentDidMount() {
-        window.addEventListener('hashchange', this.handleHashChange);
-    }
-
-    componentWillUnmount() {
-        window.removeEventListener('hashchange', this.handleHashChange);
-    }
-
-    handleHashChange = () => {
-        this.setState({ selectedKey: getSelectedMenuKey() });
-    };
 
     toggleCollapsed = () => {
         const collapsed = !this.state.collapsed;
@@ -89,8 +79,7 @@ class RootLayout extends React.Component<Props, State> {
     render() {
         const { collapsed } = this.state;
         return (
-            <Router>
-                <Layout className="all-layout">
+            <Layout className="all-layout">
                     <Header className="header small-header">
                         <h3 className="logo-text">Bililive-go</h3>
                         <Link className="mobile-diagnostic-link" to="/diagnostics">
@@ -131,7 +120,7 @@ class RootLayout extends React.Component<Props, State> {
                             </div>
                             <Menu
                                 mode="inline"
-                                selectedKeys={[this.state.selectedKey]}
+                                selectedKeys={[this.props.selectedKey]}
                                 inlineCollapsed={collapsed}
                                 style={{ borderRight: 0 }}
                                 items={[
@@ -206,10 +195,25 @@ class RootLayout extends React.Component<Props, State> {
                             </Content>
                         </Layout>
                     </Layout>
-                </Layout>
-            </Router>
+            </Layout>
         )
     }
 }
+
+const RoutedRootLayoutContent: React.FC<Props> = (props) => {
+    const location = useLocation();
+    return (
+        <RootLayoutContent
+            {...props}
+            selectedKey={getSelectedMenuKey(location.pathname)}
+        />
+    );
+};
+
+const RootLayout: React.FC<Props> = (props) => (
+    <Router>
+        <RoutedRootLayoutContent {...props} />
+    </Router>
+);
 
 export default RootLayout;
