@@ -13,7 +13,8 @@ import {
     LineChartOutlined,
     CloudUploadOutlined,
     CalendarOutlined,
-    CommentOutlined
+    CommentOutlined,
+    BugOutlined
 } from '@ant-design/icons';
 import './layout.css';
 
@@ -27,10 +28,24 @@ interface Props {
 
 interface State {
     collapsed: boolean;
+    selectedKey: string;
 }
 
 // localStorage key 用于保存侧边栏收起状态
 const SIDER_COLLAPSED_KEY = 'siderCollapsed';
+
+const getSelectedMenuKey = (): string => {
+    const path = window.location.hash.replace(/^#/, '') || '/';
+    if (path.startsWith('/liveInfo')) return '2';
+    if (path.startsWith('/configInfo')) return '3';
+    if (path.startsWith('/danmaku')) return 'danmaku';
+    if (path.startsWith('/fileList')) return '4';
+    if (path.startsWith('/tasks')) return 'tasks';
+    if (path.startsWith('/diagnostics')) return 'diagnostics';
+    if (path.startsWith('/iostats')) return 'iostats';
+    if (path.startsWith('/update')) return 'update';
+    return '1';
+};
 
 class RootLayout extends React.Component<Props, State> {
     constructor(props: Props) {
@@ -45,8 +60,20 @@ class RootLayout extends React.Component<Props, State> {
         } catch (e) {
             console.error('读取侧边栏状态失败:', e);
         }
-        this.state = { collapsed };
+        this.state = { collapsed, selectedKey: getSelectedMenuKey() };
     }
+
+    componentDidMount() {
+        window.addEventListener('hashchange', this.handleHashChange);
+    }
+
+    componentWillUnmount() {
+        window.removeEventListener('hashchange', this.handleHashChange);
+    }
+
+    handleHashChange = () => {
+        this.setState({ selectedKey: getSelectedMenuKey() });
+    };
 
     toggleCollapsed = () => {
         const collapsed = !this.state.collapsed;
@@ -66,6 +93,10 @@ class RootLayout extends React.Component<Props, State> {
                 <Layout className="all-layout">
                     <Header className="header small-header">
                         <h3 className="logo-text">Bililive-go</h3>
+                        <Link className="mobile-diagnostic-link" to="/diagnostics">
+                            <BugOutlined />
+                            诊断分析
+                        </Link>
                     </Header>
                     <Layout>
                         <Sider
@@ -100,7 +131,7 @@ class RootLayout extends React.Component<Props, State> {
                             </div>
                             <Menu
                                 mode="inline"
-                                defaultSelectedKeys={['1']}
+                                selectedKeys={[this.state.selectedKey]}
                                 inlineCollapsed={collapsed}
                                 style={{ borderRight: 0 }}
                                 items={[
@@ -138,6 +169,11 @@ class RootLayout extends React.Component<Props, State> {
                                         key: 'tasks',
                                         icon: <UnorderedListOutlined />,
                                         label: <Link to="/tasks">任务队列</Link>,
+                                    },
+                                    {
+                                        key: 'diagnostics',
+                                        icon: <BugOutlined />,
+                                        label: <Link to="/diagnostics">诊断分析</Link>,
                                     },
                                     {
                                         key: 'scheduler',
