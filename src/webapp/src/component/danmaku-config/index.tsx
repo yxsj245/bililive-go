@@ -8,12 +8,19 @@ import API from '../../utils/api';
 const api = new API();
 
 // 字幕烧录：视频编码器选项
-const NVENC_CODEC = 'h264_nvenc';
 const BURN_CODEC_OPTIONS = [
   { label: 'libx264 (H.264，兼容性好)', value: 'libx264' },
   { label: 'libx265 (H.265，压缩率高)', value: 'libx265' },
-  { label: 'h264_nvenc (NVIDIA 硬件编码，速度快但体积略大)', value: NVENC_CODEC },
+  { label: 'h264_nvenc (NVIDIA H.264 硬件编码，速度快)', value: 'h264_nvenc' },
+  { label: 'hevc_nvenc (NVIDIA H.265 硬件编码，压缩率更高)', value: 'hevc_nvenc' },
+  { label: 'av1_nvenc (NVIDIA AV1 硬件编码，需 RTX 40 系及以上)', value: 'av1_nvenc' },
 ];
+
+// 与后端 isNvencCodec 保持一致的判断逻辑：编码器名包含 nvenc 即视为 NVIDIA 硬件编码器
+// （h264_nvenc / hevc_nvenc / av1_nvenc 等），保证通过 YAML/API 写入的编码器
+// 在界面上同样按 NVENC 处理（CQ 标签、p1-p7 预设），避免预设被静默改写
+const isNvencCodec = (codec?: string) =>
+  typeof codec === 'string' && codec.toLowerCase().includes('nvenc');
 
 // 字幕烧录：libx264/libx265 编码预设
 const X264_PRESET_OPTIONS = [
@@ -28,7 +35,7 @@ const X264_PRESET_OPTIONS = [
   { label: 'veryslow (最慢，画质最好)', value: 'veryslow' },
 ];
 
-// 字幕烧录：NVIDIA h264_nvenc 编码预设（p1-p7）
+// 字幕烧录：NVIDIA NVENC 编码预设（p1-p7，适用于 h264_nvenc/hevc_nvenc/av1_nvenc 等）
 const NVENC_PRESET_OPTIONS = [
   { label: 'p1 (NVENC 最快，画质最差)', value: 'p1' },
   { label: 'p2 (NVENC)', value: 'p2' },
@@ -43,8 +50,9 @@ const NVENC_PRESET_OPTIONS = [
 const DEFAULT_PRESET_BY_CODEC: Record<string, string> = {
   libx264: 'medium',
   libx265: 'medium',
-  [NVENC_CODEC]: 'p5',
 };
+// NVENC 系列编码器（含未在选项列表中的自定义名称）的默认预设
+const NVENC_DEFAULT_PRESET = 'p5';
 
 const DEFAULT_DANMAKU: DanmakuConfig = {
   font_size: 36,
@@ -379,7 +387,7 @@ const DanmakuSettings: React.FC = () => {
   const [platformRooms, setPlatformRooms] = useState<Record<string, RoomInfo[]>>({});
   const [burnForm] = Form.useForm();
   const burnCodec = Form.useWatch('burn_subtitles_codec', burnForm);
-  const isNvenc = burnCodec === NVENC_CODEC;
+  const isNvenc = isNvencCodec(burnCodec);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -435,7 +443,9 @@ const DanmakuSettings: React.FC = () => {
     const currentPreset = burnForm.getFieldValue('burn_subtitles_preset');
     if (!validPresets.some(option => option.value === currentPreset)) {
       burnForm.setFieldsValue({
-        burn_subtitles_preset: DEFAULT_PRESET_BY_CODEC[burnCodec] ?? 'medium',
+        burn_subtitles_preset: isNvenc
+          ? NVENC_DEFAULT_PRESET
+          : (DEFAULT_PRESET_BY_CODEC[burnCodec] ?? 'medium'),
       });
     }
   }, [burnCodec, isNvenc, burnForm]);
@@ -588,7 +598,7 @@ const DanmakuSettings: React.FC = () => {
             <Form.Item
               label="视频编码器"
               name="burn_subtitles_codec"
-              extra="默认 libx264，可选 libx265 或 NVIDIA 硬件编码 h264_nvenc（需要显卡驱动和受支持的 GPU）"
+              extra="默认 libx264，可选 libx265 或 NVIDIA 硬件编码 h264_nvenc / hevc_nvenc / av1_nvenc（需要显卡驱动和受支持的 GPU）"
             >
               <Select options={BURN_CODEC_OPTIONS} />
             </Form.Item>
@@ -596,8 +606,20 @@ const DanmakuSettings: React.FC = () => {
               label={isNvenc ? 'CQ 质量值' : 'CRF 质量值'}
               name="burn_subtitles_crf"
               extra={isNvenc
-                ? '0-51，越小画质越好（NVENC 恒定质量参数，对应 FFmpeg -cq），默认 18'
-                : '0-51，越小画质越好，默认 18'}
+                ? '1-51，越小画质越好（NVENC 恒定质量参数，对应 FFmpeg -cq）；0 表示自动质量而非最高画质，默认 18'
+                : '0-51，越小画质越好（对应 FFmpeg -crf），默认 18'}
+              rules={[
+                {
+                  validator: (_, value) => {
+                    if (value === undefined || value === null || value === '') return Promise.resolve();
+                    const quality = Number(value);
+                    if (!Number.isInteger(quality) || quality < 0 || quality > 51) {
+                      return Promise.reject(new Error('质量值必须是 0-51 的整数'));
+                    }
+                    return Promise.resolve();
+                  },
+                },
+              ]}
             >
               <Input placeholder="18" />
             </Form.Item>
@@ -606,7 +628,7 @@ const DanmakuSettings: React.FC = () => {
               name="burn_subtitles_preset"
               extra={isNvenc
                 ? 'NVENC 预设：p1 最快、p7 画质最好，常用 p5'
-                : 'x264 预设：速度越慢，画质越好，文件越小'}
+                : 'x264/x265 预设：速度越慢，画质越好，文件越小'}
               rules={[
                 {
                   validator: (_, value) => {

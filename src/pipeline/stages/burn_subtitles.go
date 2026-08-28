@@ -39,23 +39,37 @@ func isNvencCodec(codec string) bool {
 // buildVideoEncodeArgs 根据编码器生成 FFmpeg 视频编码参数。
 // 软编码（libx264/libx265 等）使用 -crf + -preset；
 // NVENC 硬件编码不支持 CRF，改为 -rc:v vbr -cq <值> -b:v 0 -preset <p1-p7> 实现恒定质量输出。
-// 注：配置项 burn_subtitles_crf 对 NVENC 的语义为 CQ 质量值（0-51，越小画质越好），
-// 字段名保持不变以兼容已有配置。
+// 注：配置项 burn_subtitles_crf 对 NVENC 的语义为 CQ 质量值（1-51，越小画质越好），
+// 0 表示"自动质量"（FFmpeg 的 -cq 选项定义：0 means automatic），此时省略 -cq 交由
+// 编码器自动决定质量，字段名保持不变以兼容已有配置。
 func buildVideoEncodeArgs(codec, crf, preset string) []string {
 	if isNvencCodec(codec) {
-		return []string{
+		args := []string{
 			"-c:v", codec,
 			"-rc:v", "vbr",
-			"-cq", crf,
+		}
+		// -cq 为 0 时是"自动质量"而非最高画质（显式传 -cq 0 与 FFmpeg 默认行为一致），
+		// 这里直接省略该参数，避免用户把 0 误解为最佳画质
+		if !isZeroQuality(crf) {
+			args = append(args, "-cq", crf)
+		}
+		return append(args,
 			"-b:v", "0",
 			"-preset", preset,
-		}
+		)
 	}
 	return []string{
 		"-c:v", codec,
 		"-crf", crf,
 		"-preset", preset,
 	}
+}
+
+// isZeroQuality 判断质量值在数值上是否为 0（如 "0"、"00"、"0.0"），即 NVENC 的自动质量。
+// 非数字值不视为 0，原样传给 FFmpeg 以保留其明确的报错信息。
+func isZeroQuality(quality string) bool {
+	value, err := strconv.ParseFloat(strings.TrimSpace(quality), 64)
+	return err == nil && value == 0
 }
 
 // NewBurnSubtitlesStage 创建弹幕字幕烧录阶段工厂

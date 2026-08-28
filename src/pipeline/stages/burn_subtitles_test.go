@@ -64,4 +64,62 @@ func TestBuildVideoEncodeArgs(t *testing.T) {
 		}, args)
 		assert.NotContains(t, args, "-crf")
 	})
+
+	t.Run("NVENC CQ 为 0 时表示自动质量，省略 -cq 参数", func(t *testing.T) {
+		args := buildVideoEncodeArgs("h264_nvenc", "0", "p5")
+		assert.Equal(t, []string{
+			"-c:v", "h264_nvenc",
+			"-rc:v", "vbr",
+			"-b:v", "0",
+			"-preset", "p5",
+		}, args)
+		assert.NotContains(t, args, "-cq")
+		assert.NotContains(t, args, "-crf")
+	})
+
+	t.Run("NVENC CQ 为数值 0 的其他写法（00/0.0）同样省略 -cq", func(t *testing.T) {
+		for _, cq := range []string{"00", "0.0"} {
+			args := buildVideoEncodeArgs("av1_nvenc", cq, "p4")
+			assert.NotContains(t, args, "-cq")
+			assert.Contains(t, args, "-preset")
+			assert.Equal(t, "p4", args[len(args)-1])
+		}
+	})
+
+	t.Run("NVENC CQ 为非法值时原样传递，交由 FFmpeg 报错", func(t *testing.T) {
+		args := buildVideoEncodeArgs("h264_nvenc", "abc", "p5")
+		assert.Equal(t, []string{
+			"-c:v", "h264_nvenc",
+			"-rc:v", "vbr",
+			"-cq", "abc",
+			"-b:v", "0",
+			"-preset", "p5",
+		}, args)
+	})
+
+	t.Run("软编码 CRF 为 0 时仍保留 -crf（libx264 的 0 表示无损）", func(t *testing.T) {
+		args := buildVideoEncodeArgs("libx264", "0", "medium")
+		assert.Equal(t, []string{"-c:v", "libx264", "-crf", "0", "-preset", "medium"}, args)
+	})
+}
+
+func TestIsZeroQuality(t *testing.T) {
+	tests := []struct {
+		name    string
+		quality string
+		want    bool
+	}{
+		{"整数字符串 0", "0", true},
+		{"带前导零", "00", true},
+		{"小数 0.0", "0.0", true},
+		{"带空格", " 0 ", true},
+		{"非 0 数值", "18", false},
+		{"非法字符串", "abc", false},
+		{"空字符串", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isZeroQuality(tt.quality))
+		})
+	}
 }
