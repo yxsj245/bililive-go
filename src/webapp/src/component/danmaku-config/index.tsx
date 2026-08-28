@@ -593,9 +593,11 @@ const DanmakuSettings: React.FC = () => {
               <Select options={BURN_CODEC_OPTIONS} />
             </Form.Item>
             <Form.Item
-              label="CRF 质量值"
+              label={isNvenc ? 'CQ 质量值' : 'CRF 质量值'}
               name="burn_subtitles_crf"
-              extra="0-51，越小画质越好，默认 18"
+              extra={isNvenc
+                ? '0-51，越小画质越好（NVENC 恒定质量参数，对应 FFmpeg -cq），默认 18'
+                : '0-51，越小画质越好，默认 18'}
             >
               <Input placeholder="18" />
             </Form.Item>
@@ -612,7 +614,7 @@ const DanmakuSettings: React.FC = () => {
                     const validPresets = isNvenc ? NVENC_PRESET_OPTIONS : X264_PRESET_OPTIONS;
                     return validPresets.some(option => option.value === value)
                       ? Promise.resolve()
-                      : Promise.reject(new Error(`预设 ${value} 不适用于当前编码器，已自动调整为默认档位`));
+                      : Promise.reject(new Error(`预设 ${value} 不是当前编码器支持的预设，请重新选择`));
                   },
                 },
               ]}

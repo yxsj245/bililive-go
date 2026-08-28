@@ -30,6 +30,34 @@ type BurnSubtitlesStage struct {
 	logs         string
 }
 
+// isNvencCodec 判断编码器是否为 NVIDIA NVENC 硬件编码器（h264_nvenc / hevc_nvenc / av1_nvenc 等）。
+// NVENC 编码器不支持 -crf，恒定质量参数使用 -cq，因此 FFmpeg 参数构造逻辑不同。
+func isNvencCodec(codec string) bool {
+	return strings.Contains(strings.ToLower(codec), "nvenc")
+}
+
+// buildVideoEncodeArgs 根据编码器生成 FFmpeg 视频编码参数。
+// 软编码（libx264/libx265 等）使用 -crf + -preset；
+// NVENC 硬件编码不支持 CRF，改为 -rc:v vbr -cq <值> -b:v 0 -preset <p1-p7> 实现恒定质量输出。
+// 注：配置项 burn_subtitles_crf 对 NVENC 的语义为 CQ 质量值（0-51，越小画质越好），
+// 字段名保持不变以兼容已有配置。
+func buildVideoEncodeArgs(codec, crf, preset string) []string {
+	if isNvencCodec(codec) {
+		return []string{
+			"-c:v", codec,
+			"-rc:v", "vbr",
+			"-cq", crf,
+			"-b:v", "0",
+			"-preset", preset,
+		}
+	}
+	return []string{
+		"-c:v", codec,
+		"-crf", crf,
+		"-preset", preset,
+	}
+}
+
 // NewBurnSubtitlesStage 创建弹幕字幕烧录阶段工厂
 func NewBurnSubtitlesStage(config pipeline.StageConfig) (pipeline.Stage, error) {
 	codec := config.GetStringOption(pipeline.OptionCodec, "libx264")
@@ -132,14 +160,15 @@ func (s *BurnSubtitlesStage) Execute(ctx *pipeline.PipelineContext, input []pipe
 		args := []string{
 			"-i", file.Path,
 			"-vf", vfArg,
-			"-c:v", s.codec,
-			"-crf", s.crf,
-			"-preset", s.preset,
+		}
+		// 按编码器生成质量/预设参数（NVENC 与软编码参数不同）
+		args = append(args, buildVideoEncodeArgs(s.codec, s.crf, s.preset)...)
+		args = append(args,
 			"-c:a", "copy",
 			"-y",
 			"-progress", "pipe:1",
 			tempFile,
-		}
+		)
 
 		ctx.Logger.Infof("烧录字幕 FFmpeg 命令: %s %s", ffmpegPath, strings.Join(args, " "))
 		ctx.Logger.Infof("烧录字幕 ASS 路径: %s (原始: %s)", escapedAssPath, assPath)
