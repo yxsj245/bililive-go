@@ -436,19 +436,25 @@ const DanmakuSettings: React.FC = () => {
   }, [config, burnForm]);
 
   // 编码预设与编码器联动：预设只能选择当前编码器支持的档位，
-  // 切换编码器时若当前预设不适用，自动重置为该编码器的默认档位
+  // 切换编码器时若当前预设不适用，自动重置为该编码器的默认档位。
+  // 注意：codec/preset 必须用 getFieldsValue 一次性原子读取，不能使用渲染闭包中的
+  // burnCodec/isNvenc —— 配置异步加载时 setFieldsValue 先写入"编码器+预设"组合，
+  // 而 useWatch 的值要等下一轮渲染才更新，用旧编码器校验刚写入的预设会把
+  // 有效的 p1-p7 误判为无效并重置，导致用户已保存的配置在界面加载后丢失。
   useEffect(() => {
     if (!burnCodec) return;
-    const validPresets = isNvenc ? NVENC_PRESET_OPTIONS : X264_PRESET_OPTIONS;
-    const currentPreset = burnForm.getFieldValue('burn_subtitles_preset');
-    if (!validPresets.some(option => option.value === currentPreset)) {
+    const { burn_subtitles_codec: codec, burn_subtitles_preset: preset } =
+      burnForm.getFieldsValue(['burn_subtitles_codec', 'burn_subtitles_preset']);
+    const nvenc = isNvencCodec(codec);
+    const validPresets = nvenc ? NVENC_PRESET_OPTIONS : X264_PRESET_OPTIONS;
+    if (!validPresets.some(option => option.value === preset)) {
       burnForm.setFieldsValue({
-        burn_subtitles_preset: isNvenc
+        burn_subtitles_preset: nvenc
           ? NVENC_DEFAULT_PRESET
-          : (DEFAULT_PRESET_BY_CODEC[burnCodec] ?? 'medium'),
+          : (DEFAULT_PRESET_BY_CODEC[codec] ?? 'medium'),
       });
     }
-  }, [burnCodec, isNvenc, burnForm]);
+  }, [burnCodec, burnForm]);
 
   const handleSaveGlobal = async (values: any) => {
     setSaving(true);
@@ -475,6 +481,11 @@ const DanmakuSettings: React.FC = () => {
   const handleSaveBurnSettings = async () => {
     try {
       const values = await burnForm.validateFields();
+      // 空白质量值保存时归一化为默认值，避免后端生成 "-crf """ / "-cq """ 导致 FFmpeg 烧录失败
+      if (String(values.burn_subtitles_crf ?? '').trim() === '') {
+        values.burn_subtitles_crf = DEFAULT_BURN.burn_subtitles_crf;
+        burnForm.setFieldsValue({ burn_subtitles_crf: values.burn_subtitles_crf });
+      }
       setSaving(true);
       await api.updateConfig({
         on_record_finished: {
@@ -611,10 +622,12 @@ const DanmakuSettings: React.FC = () => {
               rules={[
                 {
                   validator: (_, value) => {
-                    if (value === undefined || value === null || value === '') return Promise.resolve();
-                    const quality = Number(value);
+                    // 空白输入表示使用默认值（保存时归一化为 18），这里放行
+                    const str = String(value ?? '').trim();
+                    if (str === '') return Promise.resolve();
+                    const quality = Number(str);
                     if (!Number.isInteger(quality) || quality < 0 || quality > 51) {
-                      return Promise.reject(new Error('质量值必须是 0-51 的整数'));
+                      return Promise.reject(new Error('质量值必须是 0-51 的整数，留空使用默认值 18'));
                     }
                     return Promise.resolve();
                   },

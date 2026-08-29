@@ -9,8 +9,8 @@
 |------|------|--------|
 | `burn_subtitles` | 是否开启字幕烧录 | `false` |
 | `burn_subtitles_codec` | 视频编码器，可选 `libx264` / `libx265` / `h264_nvenc` / `hevc_nvenc` / `av1_nvenc` | `libx264` |
-| `burn_subtitles_crf` | 质量值（软编码为 CRF，NVENC 为 CQ），越小画质越好；NVENC 的 `0` 表示自动质量 | `18` |
-| `burn_subtitles_preset` | 编码预设（与编码器联动，见下文） | `medium` |
+| `burn_subtitles_crf` | 质量值（软编码为 CRF，NVENC 为 CQ），越小画质越好；NVENC 的 `0` 表示自动质量；留空或空白时使用默认值 | `18` |
+| `burn_subtitles_preset` | 编码预设（与编码器联动，见下文）；留空或空白时使用默认值 | `medium` |
 | `burn_delete_ass` | 烧录成功后删除 ASS 文件 | `false` |
 | `burn_delete_source` | 烧录成功后删除源视频（仅保留 MKV） | `false` |
 
@@ -37,6 +37,9 @@
 - 使用 **NVENC 硬件编码**时，NVENC 编码器不支持 CRF，后端自动改传恒定质量参数
   `-rc:v vbr -cq <值> -b:v 0 -preset <档位>`（`cq` 为 NVENC 的恒定质量参数，`-b:v 0` 表示
   码率由质量决定、不设上限）。
+
+质量值留空或为空白（Web 界面表单清空、配置文件或 API 写入 `""`）时，后端会回退为默认值 `18`，
+不会把空字符串传给 FFmpeg 生成无效的 `-crf ""` / `-cq ""` 参数；编码预设留空时同理回退为 `medium`。
 
 NVENC 的 CQ 取值注意（以 `ffmpeg -h encoder=h264_nvenc` 的说明为准）：
 

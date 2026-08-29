@@ -72,11 +72,29 @@ func isZeroQuality(quality string) bool {
 	return err == nil && value == 0
 }
 
+// 烧录阶段各配置项的默认值
+const (
+	defaultBurnCodec   = "libx264"
+	defaultBurnQuality = "18"
+	defaultBurnPreset  = "medium"
+)
+
+// normalizeNonBlank 归一化配置字符串：去除首尾空白，空白值回退为默认值。
+// 空白的质量值/预设（前端表单清空，或 YAML/API 直接写入 ""）会生成
+// "-crf """/"-preset """ 这类无效 FFmpeg 参数导致烧录失败，在这里统一兜底。
+func normalizeNonBlank(value, fallback string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fallback
+	}
+	return trimmed
+}
+
 // NewBurnSubtitlesStage 创建弹幕字幕烧录阶段工厂
 func NewBurnSubtitlesStage(config pipeline.StageConfig) (pipeline.Stage, error) {
-	codec := config.GetStringOption(pipeline.OptionCodec, "libx264")
-	crf := config.GetStringOption(pipeline.OptionCrf, "18")
-	preset := config.GetStringOption(pipeline.OptionPreset, "medium")
+	codec := normalizeNonBlank(config.GetStringOption(pipeline.OptionCodec, defaultBurnCodec), defaultBurnCodec)
+	crf := normalizeNonBlank(config.GetStringOption(pipeline.OptionCrf, defaultBurnQuality), defaultBurnQuality)
+	preset := normalizeNonBlank(config.GetStringOption(pipeline.OptionPreset, defaultBurnPreset), defaultBurnPreset)
 	deleteAss := config.GetBoolOption(pipeline.OptionBurnDeleteAss, false)
 	deleteSource := config.GetBoolOption(pipeline.OptionBurnDeleteSource, false)
 	return &BurnSubtitlesStage{

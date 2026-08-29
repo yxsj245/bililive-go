@@ -3,6 +3,7 @@ package stages
 import (
 	"testing"
 
+	"github.com/bililive-go/bililive-go/src/pipeline"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -120,6 +121,62 @@ func TestIsZeroQuality(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, isZeroQuality(tt.quality))
+		})
+	}
+}
+
+func TestNormalizeNonBlank(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"空字符串回退默认值", "", "18"},
+		{"纯空白回退默认值", "   ", "18"},
+		{"正常值原样保留", "23", "23"},
+		{"带首尾空白的值被裁剪", " 20 ", "20"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeNonBlank(tt.value, "18"))
+		})
+	}
+}
+
+func TestNewBurnSubtitlesStageBlankOptionsFallback(t *testing.T) {
+	tests := []struct {
+		name       string
+		options    map[string]any
+		wantCrf    string
+		wantPreset string
+	}{
+		{
+			name:       "空白 CRF 回退默认 18",
+			options:    map[string]any{"crf": ""},
+			wantCrf:    "18",
+			wantPreset: "medium",
+		},
+		{
+			name:       "空白预设回退默认 medium",
+			options:    map[string]any{"crf": "20", "preset": "   "},
+			wantCrf:    "20",
+			wantPreset: "medium",
+		},
+		{
+			name:       "带空白的 CRF 被裁剪",
+			options:    map[string]any{"crf": " 22 ", "preset": " slow "},
+			wantCrf:    "22",
+			wantPreset: "slow",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stage, err := NewBurnSubtitlesStage(pipeline.StageConfig{Options: tt.options})
+			assert.NoError(t, err)
+			burnStage, ok := stage.(*BurnSubtitlesStage)
+			assert.True(t, ok)
+			assert.Equal(t, tt.wantCrf, burnStage.crf)
+			assert.Equal(t, tt.wantPreset, burnStage.preset)
 		})
 	}
 }
