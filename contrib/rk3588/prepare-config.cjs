@@ -1,4 +1,4 @@
-// 仅更新硬件处理相关配置，保留直播间、输出目录和其他设置。
+// 更新硬件处理与专用容器存储路径，保留直播间、录像目录和其他设置。
 const fs = require('fs');
 const path = require('path');
 const yaml = require('../../src/webapp/node_modules/js-yaml');
@@ -8,6 +8,9 @@ const resolved = path.resolve(file);
 const original = fs.readFileSync(resolved, 'utf8');
 const config = yaml.load(original);
 config.ffmpeg_path = '/opt/rk3588/bin/ffmpeg';
+// 配合 Compose 板载 appdata 挂载；不复制旧数据库，避免空闲统计写外盘。
+config.app_data_path = '/var/lib/bililive-go';
+config.log = { ...config.log, out_put_folder: '/var/lib/bililive-go/logs' };
 config.on_record_finished = {
   ...config.on_record_finished,
   // 旧 FLV 修复会原地替换源文件，安全验证默认关闭；需要时手动开启。

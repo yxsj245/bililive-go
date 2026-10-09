@@ -15,7 +15,8 @@
 ## 目录和固定版本
 
 - 源码：`/opt/Code/bililive-go`，以 Git 工作区保存未提交补丁；禁止用在线更新覆盖。
-- 最终部署与交付：`/opt/DockerDate/bililive-go`，包含运行配置、`manage.sh`、`docs/`、`verification/` 与 `backups/`。开发目录仅作编译调试；发布容器内嵌网页和程序，不挂载开发目录。
+- 最终部署与交付：`/opt/DockerDate/bililive-go`，包含运行配置、`manage.sh`、`docs/` 与板载 `appdata/`；旧验证素材与备份已按用户要求清理。开发目录仅作编译调试；发布容器内嵌网页和程序，不挂载开发目录。
+- 板载应用数据：部署目录 `appdata/` → `/var/lib/bililive-go`；数据库、工具和日志与录像分离。
 - 原录像外盘：`/media/ztl/LinuxDate/files/直播录制`，容器内仍为 `/srv/bililive`。
 - 专用 FFmpeg：镜像内 `/opt/rk3588/bin/ffmpeg`，ffprobe 同目录。
 - 多媒体构建上下文：`/opt/Code/rk3588-media-build`，不访问历史录像。
@@ -29,7 +30,7 @@
 | MPP | rockchip-linux/mpp | 14729dd578e570e5f00fd1dd2113f5429012d64b |
 | RGA | airockchip/librga（ARM64 预编译库） | 2b32edcb97b601b25683e2941d888c8515da6d55 |
 
-基础 Ubuntu 镜像摘要和源码提交均记录在 `contrib/rk3588/Dockerfile.media`。Ubuntu 包仓库未使用快照锁定，因此未来从零构建并非逐字节复现；还原归档包含已验证镜像，优先导入归档。
+基础 Ubuntu 镜像摘要和源码提交均记录在 `contrib/rk3588/Dockerfile.media`。Ubuntu 包仓库未使用快照锁定，因此未来从零构建并非逐字节复现；已有 Docker 镜像仍保留；旧还原归档已在后续清理中删除，不能再依赖旧包。
 
 ## 构建
 
@@ -53,11 +54,13 @@ bash contrib/rk3588/build-app.sh
 node contrib/rk3588/prepare-config.cjs /opt/DockerDate/bililive-go/config.yml
 cp contrib/rk3588/docker-compose.yml /opt/DockerDate/bililive-go/docker-compose.yml
 cd /opt/DockerDate/bililive-go
+install -d -o 1000 -g 1000 -m 0755 appdata appdata/logs
+# 配置 app_data_path: /var/lib/bililive-go，以及 log.out_put_folder: /var/lib/bililive-go/logs
 docker compose config -q
 docker compose up -d
 ```
 
-默认监听局域网 `192.168.10.62:8084`，不自动开放公网或 IPv6。通过 `.env` 的 `BILILIVE_BIND_IP`、`BILILIVE_PORT`、`BILILIVE_RECORD_DIR`、`BILILIVE_IMAGE` 调整地址、挂载与镜像。数据绑定禁用自动创建不存在的宿主目录。
+默认监听局域网 `192.168.10.62:8084`，不自动开放公网或 IPv6。通过 `.env` 的 `BILILIVE_BIND_IP`、`BILILIVE_PORT`、`BILILIVE_RECORD_DIR`、`BILILIVE_APPDATA_DIR`、`BILILIVE_IMAGE` 调整地址、挂载与镜像。数据绑定禁用自动创建不存在的宿主目录。
 
 容器以录像目录属主 UID/GID（本机 1000:1000）运行，附加 video/render 组；只调整部署配置的所有权，不递归修改历史录像。设备仅映射 MPP、RGA、DMA heap、DRM 分配器 `card0/renderD128`；不映射 NPU 的 `card1/renderD129`，不启用 `privileged`，去掉 Linux capabilities，并开启 no-new-privileges。MPP 有一处容器专用小补丁：读取 `/opt/rk3588/device-tree/compatible`，对应只读挂载的宿主设备树。避免 Docker 的 `/proc`/`/sys` 遮蔽导致识别不到 RK3588，不挂载整个宿主 `/sys`。不要复制原镜像 entrypoint 的递归 chown，它可能改变整个历史录像目录所有权。
 
@@ -101,13 +104,11 @@ docker inspect bililive-go --format '{{.HostConfig.CpusetCpus}} {{.HostConfig.Pr
 
 硬件列表是能力探测，自检是隔离测试素材的实际执行；不能由此保证每种分辨率、像素格式或损坏录像均支持。以任务页实际 FFmpeg 命令、回退记录和输出校验为准。不会自动对历史录像批量处理。
 
-## 备份与还原
+## 数据清理与后续备份
 
-首次修改前配置保存在部署目录 `backups/pre-rk3588-20261009-163750`，包含原 Compose、配置、源码 HEAD/状态和宿主 FFmpeg SHA256。为了备份完整性只读复制过 USB 守护配置，未修改它。
+2026-10-09 按用户确认删除旧外盘应用数据库/日志、验证素材（含短录）和旧交付归档，保留 26 个直播间配置、硬件参数、源码及 Docker 镜像。板载应用数据库已重新初始化，不恢复旧任务、统计、调度历史。此后新的运行数据仍会正常生成，但不再写外盘。
 
-最终归档应包含部署配置、补丁、未跟踪源码、使用文档、测试记录、已验证应用与媒体镜像以及校验清单。还原当前适配版：先校验归档 SHA256，再 `docker load` 镜像、恢复部署配置、确认外盘挂载后启动。不要覆盖或删除外盘录像。
-
-若要撤销本次适配，停止 bililive-go，恢复首次备份的 Compose/配置即可。原部署此前没有运行容器，不必为了撤销而拉取或启动上游镜像；仍可选择保持服务停止。还原不涉及内核、HDMI 或宿主 FFmpeg。
+当前没有旧备份可供回滚。以后如主动执行 `contrib/rk3588/archive.sh`，归档保存运行定义、源码和镜像；验证目录不存在时跳过，不打包应用数据库、工具缓存和录像。还原脚本不会覆盖现存配置或自动启动，需确认板载应用目录、UID/GID 与外盘绑定。详见 `docs/rk3588-storage-layout.md`。
 
 ## 验证记录
 

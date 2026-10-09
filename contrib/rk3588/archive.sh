@@ -6,11 +6,16 @@ deploy=${DEPLOY_DIR:-/opt/DockerDate/bililive-go}
 revision=$(git -C "$root" rev-parse HEAD)
 stamp=$(date +%Y%m%d-%H%M%S)
 archive_dir="$deploy/backups/rk3588-delivery-$stamp"
-mkdir -p "$archive_dir/deploy" "$archive_dir/docs" "$archive_dir/verification" "$archive_dir/source"
+mkdir -p "$archive_dir/deploy" "$archive_dir/docs" "$archive_dir/source"
 chmod 700 "$archive_dir"
 cp -a "$deploy/config.yml" "$deploy/docker-compose.yml" "$deploy/.env" "$deploy/manage.sh" "$archive_dir/deploy/"
 cp -a "$deploy/docs/." "$archive_dir/docs/"
-cp -a "$deploy/verification/." "$archive_dir/verification/"
+# 用户可清理验证素材；归档只保存部署定义，不打包运行数据库、工具缓存或录像。
+if test -d "$deploy/verification"; then
+    mkdir -p "$archive_dir/verification"
+    cp -a "$deploy/verification/." "$archive_dir/verification/"
+fi
+if test -f "$deploy/README.md"; then cp -a "$deploy/README.md" "$archive_dir/deploy/"; fi
 cp "$root/contrib/rk3588/restore.sh" "$archive_dir/restore.sh"
 printf '%s\n' "$revision" > "$archive_dir/source/base-revision.txt"
 git -C "$root" diff --binary HEAD > "$archive_dir/source/changes.patch"

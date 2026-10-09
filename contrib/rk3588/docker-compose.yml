@@ -49,6 +49,12 @@ services:
         target: /srv/bililive
         bind:
           create_host_path: false
+      # 数据库、工具和日志位于板载存储，外盘仅保存录像。
+      - type: bind
+        source: ${BILILIVE_APPDATA_DIR:-./appdata}
+        target: /var/lib/bililive-go
+        bind:
+          create_host_path: false
     logging:
       driver: json-file
       options:

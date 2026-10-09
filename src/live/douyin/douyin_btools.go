@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/bililive-go/bililive-go/src/live"
@@ -190,9 +191,30 @@ func (l *btoolsLive) GetStreamInfos() (us []*live.StreamUrlInfo, err error) {
 		return
 	}
 
+	u = preferHTTPSStreamURL(u)
+
 	return []*live.StreamUrlInfo{
 		{
 			Url: u,
 		},
 	}, nil
+}
+
+// preferHTTPSStreamURL 优先使用抖音 CDN 的 HTTPS 流，避免 HTTP 调度跳转到不可达的 IPv6 节点。
+// 只调整已知 CDN 的默认 HTTP 端口，保留路径、查询签名和其他平台的地址。
+func preferHTTPSStreamURL(u *url.URL) *url.URL {
+	if u == nil || u.Scheme != "http" {
+		return u
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "douyincdn.com" && !strings.HasSuffix(host, ".douyincdn.com") {
+		return u
+	}
+	if port := u.Port(); port != "" && port != "80" {
+		return u
+	}
+	secure := *u
+	secure.Scheme = "https"
+	secure.Host = u.Hostname()
+	return &secure
 }
