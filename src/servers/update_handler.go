@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/bililive-go/bililive-go/src/configs"
 	"github.com/bililive-go/bililive-go/src/consts"
 	"github.com/bililive-go/bililive-go/src/instance"
@@ -18,6 +20,7 @@ import (
 	bilisentry "github.com/bililive-go/bililive-go/src/pkg/sentry"
 	"github.com/bililive-go/bililive-go/src/pkg/update"
 	"github.com/bililive-go/bililive-go/src/recorders"
+	"github.com/bililive-go/bililive-go/src/tools"
 )
 
 // 全局更新管理器
@@ -62,8 +65,13 @@ func GetAutoUpdater() *update.AutoUpdater {
 	return autoUpdater
 }
 
-// StartAutoUpdater 启动自动更新器
+// StartAutoUpdater 启动自动更新器。
+// 部署显式禁用自更新（BILILIVE_DISABLE_SELF_UPDATE=1）时不启动任何自动下载。
 func StartAutoUpdater(ctx context.Context) {
+	if tools.SelfUpdateDisabled() {
+		logrus.Warn("已禁用自更新，跳过自动更新器启动")
+		return
+	}
 	updater := GetAutoUpdater()
 	if updater != nil {
 		updater.Start(ctx)
@@ -175,6 +183,13 @@ func checkUpdate(w http.ResponseWriter, r *http.Request) {
 // downloadUpdate 下载更新
 // POST /api/update/download
 func downloadUpdate(w http.ResponseWriter, r *http.Request) {
+	if tools.SelfUpdateDisabled() {
+		writeJsonWithStatusCode(w, http.StatusBadRequest, commonResp{
+			ErrNo:  http.StatusBadRequest,
+			ErrMsg: tools.SelfUpdateDisabledMessage(),
+		})
+		return
+	}
 	manager := getUpdateManager()
 
 	// 检查是否有可用更新
@@ -289,6 +304,14 @@ type ApplyUpdateRequest struct {
 //
 //	{"force_now": true} - 立即升级（中断录制）
 func applyUpdate(w http.ResponseWriter, r *http.Request) {
+	// 专用镜像禁止运行期替换自身二进制：更新只能通过重新部署镜像完成
+	if tools.SelfUpdateDisabled() {
+		writeJsonWithStatusCode(w, http.StatusBadRequest, commonResp{
+			ErrNo:  http.StatusBadRequest,
+			ErrMsg: tools.SelfUpdateDisabledMessage(),
+		})
+		return
+	}
 	manager := getUpdateManager()
 
 	// 检查更新是否已准备好

@@ -271,6 +271,16 @@ func FFmpegAsyncInit(ctx context.Context) {
 			return
 		}
 
+		// 专用镜像禁用自更新时，不允许下载/替换 FFmpeg（镜像内固定的 FFmpeg 优先）
+		if SelfUpdateDisabled() {
+			blog.GetLogger().Warnf("已禁用自更新（%s=1），且未找到可用的系统 FFmpeg", EnvDisableSelfUpdate)
+			setFFmpegStatus(FFmpegStatus{
+				State:   "not_found",
+				Message: "已禁用自动下载（" + EnvDisableSelfUpdate + "=1），且未找到 FFmpeg；请显式配置 ffmpeg_path",
+			})
+			return
+		}
+
 		// 需要下载；程序若已在退出流程中则不再发起耗时下载
 		if ctx.Err() != nil {
 			return
@@ -496,6 +506,11 @@ func SyncBuiltInTools(targetToolFolder string) (err error) {
 		"node",
 		"biliLive-tools",
 	} {
+		// 专用镜像已内置硬件处理所需的 FFmpeg，禁用自更新时不得用下载版本替换
+		if toolName == "ffmpeg" && SelfUpdateDisabled() {
+			blog.GetLogger().Infoln("已禁用自更新，跳过内置 FFmpeg 的下载/替换")
+			continue
+		}
 		var tool tools.Tool
 		tool, err = api.GetTool(toolName)
 		if err != nil {

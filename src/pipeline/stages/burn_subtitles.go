@@ -1,54 +1,85 @@
 package stages
 
 import (
-	"bufio"
-	"context"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 
+	"github.com/bililive-go/bililive-go/src/media"
 	"github.com/bililive-go/bililive-go/src/pipeline"
-	bilisentry "github.com/bililive-go/bililive-go/src/pkg/sentry"
 	"github.com/bililive-go/bililive-go/src/pkg/utils"
 	"github.com/bililive-go/bililive-go/src/tools"
 )
 
-// BurnSubtitlesStage 弹幕字幕烧录阶段
+// BurnSubtitlesStage 弹幕烧录 / 硬件压缩阶段。
+//
+// 同一阶段内完成两种处理，避免"先烧录再压缩"的二次编码：
+//   - 有同名 .ass 且启用了烧录：硬解 → 弹幕烧录 → 硬编码（H.265/H.264）
+//   - 无 .ass 且启用压缩：硬解 → 硬编码，独立完成 H.265 压缩
+//
+// 输出规则：先写入同目录临时文件，校验通过后再原子发布；
+// 目标文件已存在时自动改用带序号的新文件名，绝不覆盖现存文件。
+// 失败或取消时只清理临时文件，源视频与弹幕字幕全部保留。
 type BurnSubtitlesStage struct {
-	config       pipeline.StageConfig
-	codec        string
-	crf          string
-	preset       string
-	deleteAss    bool
-	deleteSource bool
-	commands     []string
-	logs         string
+	config pipeline.StageConfig
+
+	codec          string
+	crf            string
+	preset         string
+	bitrate        string
+	hardware       bool
+	burnEnabled    bool
+	compress       bool
+	decodeFallback bool
+	scaleWidth     int
+	scaleHeight    int
+	deleteAss      bool
+	deleteSource   bool
+
+	// capability 能力探测结果，一次任务内复用
+	capability *media.Capability
+	probed     bool
+
+	commands []string
+	logs     string
 }
 
-// NewBurnSubtitlesStage 创建弹幕字幕烧录阶段工厂
+// NewBurnSubtitlesStage 创建弹幕烧录/压缩阶段工厂
 func NewBurnSubtitlesStage(config pipeline.StageConfig) (pipeline.Stage, error) {
-	codec := config.GetStringOption(pipeline.OptionCodec, "libx264")
-	crf := config.GetStringOption(pipeline.OptionCrf, "18")
-	preset := config.GetStringOption(pipeline.OptionPreset, "medium")
-	deleteAss := config.GetBoolOption(pipeline.OptionBurnDeleteAss, false)
-	deleteSource := config.GetBoolOption(pipeline.OptionBurnDeleteSource, false)
 	return &BurnSubtitlesStage{
-		config:       config,
-		codec:        codec,
-		crf:          crf,
-		preset:       preset,
-		deleteAss:    deleteAss,
-		deleteSource: deleteSource,
+		config:         config,
+		codec:          config.GetStringOption(pipeline.OptionCodec, media.DefaultSoftwareCodec),
+		crf:            config.GetStringOption(pipeline.OptionCrf, media.DefaultCRF),
+		preset:         config.GetStringOption(pipeline.OptionPreset, media.DefaultPreset),
+		bitrate:        config.GetStringOption(pipeline.OptionBitrate, media.DefaultBitrate),
+		hardware:       config.GetBoolOption(pipeline.OptionHardware, false),
+		burnEnabled:    config.GetBoolOption(pipeline.OptionBurnEnabled, true),
+		compress:       config.GetBoolOption(pipeline.OptionCompress, false),
+		decodeFallback: config.GetBoolOption(pipeline.OptionDecodeFallback, true),
+		scaleWidth:     config.GetIntOption(pipeline.OptionScaleWidth, 0),
+		scaleHeight:    config.GetIntOption(pipeline.OptionScaleHeight, 0),
+		deleteAss:      config.GetBoolOption(pipeline.OptionBurnDeleteAss, false),
+		deleteSource:   config.GetBoolOption(pipeline.OptionBurnDeleteSource, false),
 	}, nil
 }
 
 func (s *BurnSubtitlesStage) Name() string {
 	return pipeline.StageNameBurnSubtitles
+}
+
+func (s *BurnSubtitlesStage) options() media.Options {
+	return media.Options{
+		Enabled:        s.hardware,
+		Compress:       s.compress,
+		Codec:          s.codec,
+		Bitrate:        s.bitrate,
+		CRF:            s.crf,
+		Preset:         s.preset,
+		DecodeFallback: s.decodeFallback,
+		ScaleWidth:     s.scaleWidth,
+		ScaleHeight:    s.scaleHeight,
+	}
 }
 
 func (s *BurnSubtitlesStage) Execute(ctx *pipeline.PipelineContext, input []pipeline.FileInfo) ([]pipeline.FileInfo, error) {
@@ -57,26 +88,21 @@ func (s *BurnSubtitlesStage) Execute(ctx *pipeline.PipelineContext, input []pipe
 		return input, nil
 	}
 
-	ffmpegPath := ctx.FFmpegPath
-	if ffmpegPath == "" {
-		// FFmpeg 可能仍在后台异步下载（首次启动场景），等待其就绪后再查找，
-		// 避免短直播录制结束时后处理任务因 FFmpeg 未下载完成而失败。
-		// 等待被中断（如 pipeline ctx 取消）时立即退出，不再启动烧录子进程
-		if waitErr := tools.WaitFFmpegAsyncInitDone(ctx.Ctx, nil); waitErr != nil {
-			s.logs = fmt.Sprintf("等待 FFmpeg 就绪被中断: %s", waitErr.Error())
-			return nil, waitErr
-		}
-		var err error
-		ffmpegPath, err = utils.GetFFmpegPath(ctx.Ctx)
-		if err != nil {
-			s.logs = fmt.Sprintf("ffmpeg 不可用: %s", err.Error())
-			return nil, fmt.Errorf("ffmpeg not available: %w", err)
-		}
+	ffmpegPath, err := s.resolveFFmpegPath(ctx)
+	if err != nil {
+		s.logs += ffmpegPath + "\n"
+		return nil, err
 	}
 
-	var output []pipeline.FileInfo
+	output := make([]pipeline.FileInfo, 0, len(input)+2)
 
 	for _, file := range input {
+		// 任务已取消：直接返回取消错误，交由 Executor 标记为 cancelled，
+		// 避免取消过程中产生的探测/编码失败被误报成硬件错误
+		if err := ctx.Ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		// 只处理视频文件
 		if file.Type != pipeline.FileTypeVideo {
 			output = append(output, file)
@@ -90,121 +116,51 @@ func (s *BurnSubtitlesStage) Execute(ctx *pipeline.PipelineContext, input []pipe
 			continue
 		}
 
-		// 检查文件是否存在
 		if _, err := os.Stat(file.Path); os.IsNotExist(err) {
 			s.logs += fmt.Sprintf("文件不存在: %s\n", file.Path)
 			continue
 		}
 
-		// 查找同名 .ass 文件
-		assPath := s.findAssFile(file.Path)
-		if assPath == "" {
-			// 无 ASS 文件，跳过，原样传递
-			s.logs += fmt.Sprintf("未找到 ASS 字幕文件，跳过烧录: %s\n", filepath.Base(file.Path))
+		// 查找同名 .ass 文件（未启用烧录时不查找）
+		assPath := ""
+		if s.burnEnabled {
+			assPath = s.findAssFile(file.Path)
+		}
+		if assPath == "" && !s.compress {
+			s.logs += fmt.Sprintf("未找到 ASS 字幕文件且未启用无弹幕压缩，跳过: %s\n", filepath.Base(file.Path))
 			output = append(output, file)
 			continue
 		}
 
-		// 确定输出文件名（.mkv）
-		ext := strings.ToLower(filepath.Ext(file.Path))
-		base := strings.TrimSuffix(file.Path, ext)
-		outputPath := base + ".mkv"
+		// 记录处理前的源文件状态：处理结束后若体积/修改时间发生变化，说明该文件仍在被写入
+		// （例如仍在录制的录像），此时不标记删除，保证源文件不被误删
+		sourceStatBefore, _ := os.Stat(file.Path)
 
-		// 如果输出路径与输入路径相同（已经是 .mkv），使用临时名
-		if outputPath == file.Path {
-			outputPath = base + ".burned.mkv"
-		}
-
-		// 临时文件路径
-		dir := filepath.Dir(outputPath)
-		baseName := filepath.Base(outputPath)
-		tempFile := filepath.Join(dir, ".burning_"+baseName)
-
-		ctx.Logger.Infof("烧录字幕: %s + %s -> %s", file.Path, filepath.Base(assPath), outputPath)
-
-		// 获取视频时长用于进度计算
-		duration := s.getVideoDuration(ctx.Ctx, ffmpegPath, file.Path)
-
-		// 构建 FFmpeg 命令
-		escapedAssPath := escapeAssPath(assPath)
-		vfArg := fmt.Sprintf("ass=%s", escapedAssPath)
-
-		args := []string{
-			"-i", file.Path,
-			"-vf", vfArg,
-			"-c:v", s.codec,
-			"-crf", s.crf,
-			"-preset", s.preset,
-			"-c:a", "copy",
-			"-y",
-			"-progress", "pipe:1",
-			tempFile,
-		}
-
-		ctx.Logger.Infof("烧录字幕 FFmpeg 命令: %s %s", ffmpegPath, strings.Join(args, " "))
-		ctx.Logger.Infof("烧录字幕 ASS 路径: %s (原始: %s)", escapedAssPath, assPath)
-
-		cmdStr := fmt.Sprintf("%s %s", ffmpegPath, strings.Join(args, " "))
-		s.commands = append(s.commands, cmdStr)
-
-		cmd := exec.CommandContext(ctx.Ctx, ffmpegPath, args...)
-
-		stdout, err := cmd.StdoutPipe()
+		outputPath := s.buildOutputPath(file.Path, assPath != "")
+		// 使用 os.CreateTemp 生成唯一临时文件，避免并发任务或重复路径互相覆盖
+		tempFile, err := media.CreateTempOutput(outputPath)
 		if err != nil {
-			s.logs += fmt.Sprintf("创建输出管道失败: %s\n", err.Error())
-			return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
+			s.logs += err.Error() + "\n"
+			return nil, err
 		}
 
-		stderr, err := cmd.StderrPipe()
+		finalPath, err := s.processFile(ctx, ffmpegPath, file.Path, assPath, outputPath, tempFile)
 		if err != nil {
-			s.logs += fmt.Sprintf("创建错误管道失败: %s\n", err.Error())
-			return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
-		}
-
-		if err := cmd.Start(); err != nil {
-			s.logs += fmt.Sprintf("启动 ffmpeg 失败: %s\n", err.Error())
-			return nil, fmt.Errorf("failed to start ffmpeg: %w", err)
-		}
-
-		// 解析进度（后台）
-		bilisentry.GoWithContext(ctx.Ctx, func(goCtx context.Context) {
-			s.parseProgress(goCtx, stdout, duration)
-		})
-
-		// 读取 stderr 用于错误诊断
-		stderrBytes, _ := io.ReadAll(stderr)
-
-		// 等待命令完成
-		if err := cmd.Wait(); err != nil {
-			os.Remove(tempFile)
-			stderrOutput := string(stderrBytes)
-			s.logs += fmt.Sprintf("ffmpeg 烧录失败: %s - %s\n", file.Path, err.Error())
-			s.logs += fmt.Sprintf("ffmpeg stderr: %s\n", stderrOutput)
-			ctx.Logger.Errorf("ffmpeg stderr: %s", stderrOutput)
-			return nil, fmt.Errorf("ffmpeg burn subtitles failed for %s: %w\nstderr: %s", file.Path, err, stderrOutput)
-		}
-
-		// 检查临时文件
-		if _, err := os.Stat(tempFile); os.IsNotExist(err) {
-			s.logs += fmt.Sprintf("临时文件未创建: %s\n", tempFile)
-			return nil, fmt.Errorf("temp file was not created: %s", tempFile)
-		}
-
-		// 重命名临时文件
-		if err := os.Rename(tempFile, outputPath); err != nil {
-			os.Remove(tempFile)
-			return nil, fmt.Errorf("failed to rename temp file: %w", err)
+			// 失败或取消都要清理临时文件；源视频与 ASS 弹幕一律保留，供用户重试
+			media.RemoveFileQuietly(tempFile)
+			s.logs += fmt.Sprintf("处理失败（源文件与弹幕已保留）: %s - %s\n", filepath.Base(file.Path), err.Error())
+			return nil, fmt.Errorf("处理 %s 失败: %w", filepath.Base(file.Path), err)
 		}
 
 		// 添加输出文件
 		output = append(output, pipeline.FileInfo{
-			Path:       outputPath,
+			Path:       finalPath,
 			Type:       pipeline.FileTypeVideo,
 			SourcePath: file.Path,
 		})
 
 		// 可选：标记 ASS 文件为可删除（由 Executor 在管道全部成功后统一删除）
-		if s.deleteAss {
+		if s.deleteAss && assPath != "" {
 			output = append(output, pipeline.FileInfo{
 				Path:      assPath,
 				Type:      pipeline.FileTypeOther,
@@ -215,18 +171,201 @@ func (s *BurnSubtitlesStage) Execute(ctx *pipeline.PipelineContext, input []pipe
 		}
 
 		// 可选：标记源视频文件为可删除（由 Executor 在管道全部成功后统一删除）
-		if s.deleteSource && file.Path != outputPath {
-			file.Deletable = true
-			s.logs += fmt.Sprintf("已标记源视频文件待删除: %s\n", file.Path)
-			ctx.Logger.Infof("已标记源视频文件待删除: %s", file.Path)
+		if s.deleteSource && file.Path != finalPath {
+			if sourceChangedSince(file.Path, sourceStatBefore) {
+				// 失败保护：源文件在处理期间仍在变化，说明它正在被写入，绝不能删除
+				s.logs += fmt.Sprintf("源文件在处理期间仍在变化，已保留不删除: %s\n", file.Path)
+				ctx.Logger.Warnf("源文件在处理期间仍在变化，已保留源文件: %s", file.Path)
+			} else {
+				file.Deletable = true
+				s.logs += fmt.Sprintf("已标记源视频文件待删除: %s\n", file.Path)
+				ctx.Logger.Infof("已标记源视频文件待删除: %s", file.Path)
+			}
 		}
 		output = append(output, file)
 
-		s.logs += fmt.Sprintf("字幕烧录完成: %s -> %s\n", filepath.Base(file.Path), filepath.Base(outputPath))
-		ctx.Logger.Infof("字幕烧录完成: %s", outputPath)
+		s.logs += fmt.Sprintf("处理完成: %s -> %s\n", filepath.Base(file.Path), filepath.Base(finalPath))
+		ctx.Logger.Infof("弹幕烧录/压缩完成: %s", finalPath)
 	}
 
 	return output, nil
+}
+
+// resolveFFmpegPath 解析本次处理要使用的 FFmpeg 路径
+func (s *BurnSubtitlesStage) resolveFFmpegPath(ctx *pipeline.PipelineContext) (string, error) {
+	if ctx.FFmpegPath != "" {
+		return ctx.FFmpegPath, nil
+	}
+	// FFmpeg 可能仍在后台异步下载（首次启动场景），等待其就绪后再查找，
+	// 避免短直播录制结束时后处理任务因 FFmpeg 未下载完成而失败。
+	// 等待被中断（如 pipeline ctx 取消）时立即退出，不再启动处理子进程
+	if waitErr := tools.WaitFFmpegAsyncInitDone(ctx.Ctx, nil); waitErr != nil {
+		return fmt.Sprintf("等待 FFmpeg 就绪被中断: %s", waitErr.Error()), waitErr
+	}
+	ffmpegPath, err := utils.GetFFmpegPath(ctx.Ctx)
+	if err != nil {
+		return fmt.Sprintf("ffmpeg 不可用: %s", err.Error()), fmt.Errorf("ffmpeg not available: %w", err)
+	}
+	return ffmpegPath, nil
+}
+
+// getCapability 返回当前 FFmpeg 的能力（一次任务内只探测一次）
+func (s *BurnSubtitlesStage) getCapability(ctx *pipeline.PipelineContext, ffmpegPath string) *media.Capability {
+	if !s.probed {
+		s.probed = true
+		s.capability = media.ProbeCached(ctx.Ctx, ffmpegPath, false)
+	}
+	return s.capability
+}
+
+// processFile 处理单个视频文件：生成处理链 → 执行 → 校验 → 原子发布
+func (s *BurnSubtitlesStage) processFile(
+	ctx *pipeline.PipelineContext,
+	ffmpegPath, inputPath, assPath, outputPath, tempFile string,
+) (string, error) {
+	// 把弹幕字幕暂存到临时目录下的固定文件名，彻底规避 FFmpeg 滤镜层的路径转义问题
+	stagedAssPath := assPath
+	if assPath != "" {
+		if staged, cleanup, stageErr := media.StageAssFile(assPath); stageErr == nil {
+			stagedAssPath = staged
+			defer cleanup()
+		} else {
+			ctx.Logger.Warnf("暂存弹幕字幕失败，将直接使用原路径（需要转义）: %v", stageErr)
+			s.logs += fmt.Sprintf("暂存弹幕字幕失败: %s\n", stageErr.Error())
+		}
+	}
+
+	capability := s.getCapability(ctx, ffmpegPath)
+	info := media.ProbeMediaInfo(ctx.Ctx, ffmpegPath, inputPath)
+
+	inputCodec := ""
+	duration := 0.0
+	if info != nil {
+		inputCodec = info.VideoCodec
+		duration = info.Duration
+	}
+
+	buildRequest := func(forceSoftwareDecode bool) media.Request {
+		return media.Request{
+			FFmpegPath:          ffmpegPath,
+			Input:               inputPath,
+			Output:              tempFile,
+			AssPath:             stagedAssPath,
+			Options:             s.options(),
+			Capability:          capability,
+			InputCodec:          inputCodec,
+			ForceSoftwareDecode: forceSoftwareDecode,
+		}
+	}
+
+	plan, err := media.BuildPlan(buildRequest(false))
+	if err != nil {
+		// 取消导致的探测/规划失败按取消处理，不要报成硬件能力问题
+		if ctxErr := ctx.Ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", err
+	}
+
+	runErr := s.runPlan(ctx, ffmpegPath, plan, duration)
+	if runErr != nil && plan.HardwareDecode && s.decodeFallback && ctx.Ctx.Err() == nil {
+		// 硬解失败（例如该输入格式的 rkmpp 解码器异常）：按配置回退软件解码重试一次，
+		// 编码仍保持硬件编码，不引入软件编码。
+		ctx.Logger.Warnf("硬件解码失败，改用软件解码重试: %v", runErr)
+		s.logs += "硬件解码失败，改用软件解码重试\n"
+		media.RemoveFileQuietly(tempFile)
+
+		retryPlan, retryErr := media.BuildPlan(buildRequest(true))
+		if retryErr != nil {
+			if ctxErr := ctx.Ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
+			return "", retryErr
+		}
+		plan = retryPlan
+		runErr = s.runPlan(ctx, ffmpegPath, plan, duration)
+	}
+	if runErr != nil {
+		return "", runErr
+	}
+
+	// 校验输出确实可用（含真实解码、时长与音轨比对），通过后才发布
+	if err := media.ValidateOutput(ctx.Ctx, ffmpegPath, inputPath, tempFile); err != nil {
+		return "", fmt.Errorf("输出校验未通过: %w", err)
+	}
+
+	finalPath, err := media.PublishTempFile(tempFile, outputPath)
+	if err != nil {
+		return "", err
+	}
+	return finalPath, nil
+}
+
+// runPlan 执行一次处理链
+func (s *BurnSubtitlesStage) runPlan(ctx *pipeline.PipelineContext, ffmpegPath string, plan *media.Plan, duration float64) error {
+	command := ffmpegPath + " " + strings.Join(plan.Args, " ")
+	s.commands = append(s.commands, command)
+
+	ctx.Logger.Infof("处理链: %s", plan.Summary())
+	ctx.Logger.Infof("FFmpeg 命令: %s", command)
+	for _, warning := range plan.Warnings {
+		s.logs += warning + "\n"
+		ctx.Logger.Warnf("处理链提示: %s", warning)
+	}
+
+	result, err := media.Run(ctx.Ctx, ffmpegPath, plan.Args, duration, nil)
+	if err != nil {
+		if result != nil && strings.TrimSpace(result.Stderr) != "" {
+			ctx.Logger.Errorf("ffmpeg stderr: %s", tailForLog(result.Stderr))
+		}
+		return err
+	}
+	return nil
+}
+
+// buildOutputPath 计算输出文件名。
+// 烧录输出统一为 .mkv（避免覆盖源文件）；纯压缩输出带 .h265/.h264 后缀以便区分。
+// 目标已存在时的去重由 media.PublishTempFile 完成。
+func (s *BurnSubtitlesStage) buildOutputPath(inputPath string, burn bool) string {
+	ext := strings.ToLower(filepath.Ext(inputPath))
+	base := strings.TrimSuffix(inputPath, ext)
+
+	if burn {
+		if ext == media.OutputExtension {
+			// 源文件已经是 mkv，不能与源文件同名
+			return base + ".burned" + media.OutputExtension
+		}
+		return base + media.OutputExtension
+	}
+
+	suffix := ".h265"
+	if strings.HasPrefix(strings.ToLower(s.codec), "h264") {
+		suffix = ".h264"
+	}
+	return base + suffix + media.OutputExtension
+}
+
+// tailForLog 截取 FFmpeg 错误输出的尾部，避免超长 stderr 刷屏
+func tailForLog(text string) string {
+	trimmed := strings.TrimSpace(text)
+	const limit = 2000
+	if len(trimmed) <= limit {
+		return trimmed
+	}
+	return "..." + trimmed[len(trimmed)-limit:]
+}
+
+// sourceChangedSince 判断源文件自 before 之后是否被修改（体积或修改时间变化）。
+// 用于避免把仍在写入的录像当作"已处理完成的源文件"删除。
+func sourceChangedSince(path string, before os.FileInfo) bool {
+	if before == nil {
+		return true
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		return true
+	}
+	return after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime())
 }
 
 // findAssFile 查找与视频文件同名的 .ass 字幕文件
@@ -234,70 +373,10 @@ func (s *BurnSubtitlesStage) findAssFile(videoPath string) string {
 	ext := strings.ToLower(filepath.Ext(videoPath))
 	base := strings.TrimSuffix(videoPath, ext)
 	assPath := base + ".ass"
-	if _, err := os.Stat(assPath); err == nil {
+	if info, err := os.Stat(assPath); err == nil && !info.IsDir() {
 		return assPath
 	}
 	return ""
-}
-
-// escapeAssPath 转义 ASS 文件路径，用于 FFmpeg 的 ass 滤镜
-// FFmpeg ass 滤镜语法: ass='path'
-// 在单引号内，只需转义 \ 和 ' 两个字符
-// Windows 路径: \ 替换为 /（跨平台兼容）
-func escapeAssPath(path string) string {
-	// 1. Windows 反斜杠 → 正斜杠
-	escaped := strings.ReplaceAll(path, "\\", "/")
-	// 2. 转义单引号（在单引号字符串内必须转义）
-	escaped = strings.ReplaceAll(escaped, "'", "\\'")
-	// 3. 用单引号包裹，保护所有特殊字符: ^ [] = ; , # ! 空格 Emoji 等
-	return "'" + escaped + "'"
-}
-
-// getVideoDuration 获取视频时长（秒）
-func (s *BurnSubtitlesStage) getVideoDuration(ctx context.Context, ffmpegPath, inputFile string) float64 {
-	cmd := exec.CommandContext(ctx, ffmpegPath,
-		"-i", inputFile,
-		"-hide_banner",
-	)
-
-	output, _ := cmd.CombinedOutput()
-
-	// 解析 Duration: HH:MM:SS.ms
-	re := regexp.MustCompile(`Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})`)
-	matches := re.FindStringSubmatch(string(output))
-	if len(matches) < 5 {
-		return 0
-	}
-
-	hours, _ := strconv.ParseFloat(matches[1], 64)
-	minutes, _ := strconv.ParseFloat(matches[2], 64)
-	seconds, _ := strconv.ParseFloat(matches[3], 64)
-	ms, _ := strconv.ParseFloat(matches[4], 64)
-
-	return hours*3600 + minutes*60 + seconds + ms/100
-}
-
-// parseProgress 解析 ffmpeg 进度输出
-func (s *BurnSubtitlesStage) parseProgress(ctx context.Context, stdout io.Reader, totalDuration float64) {
-	scanner := bufio.NewScanner(stdout)
-	re := regexp.MustCompile(`out_time_us=(\d+)`)
-
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		line := scanner.Text()
-		matches := re.FindStringSubmatch(line)
-		if len(matches) >= 2 && totalDuration > 0 {
-			timeUs, _ := strconv.ParseFloat(matches[1], 64)
-			currentTime := timeUs / 1000000
-			progress := (currentTime / totalDuration) * 100
-			_ = progress // 可以通过回调上报进度
-		}
-	}
 }
 
 func (s *BurnSubtitlesStage) GetCommands() []string {

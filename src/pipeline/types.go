@@ -172,6 +172,25 @@ func (sc *StageConfig) GetStringOption(key string, defaultValue string) string {
 	return defaultValue
 }
 
+// GetIntOption 获取整数类型选项（兼容 YAML/JSON 解析出的 int、int64 与 float64）
+func (sc *StageConfig) GetIntOption(key string, defaultValue int) int {
+	v, ok := sc.GetOption(key)
+	if !ok {
+		return defaultValue
+	}
+	switch val := v.(type) {
+	case int:
+		return val
+	case int64:
+		return int(val)
+	case float64:
+		return int(val)
+	case float32:
+		return int(val)
+	}
+	return defaultValue
+}
+
 // GetStringSliceOption 获取字符串切片类型选项
 func (sc *StageConfig) GetStringSliceOption(key string) []string {
 	v, ok := sc.GetOption(key)

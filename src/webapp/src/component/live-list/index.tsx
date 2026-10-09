@@ -7,6 +7,7 @@ import LogPanel from '../log-panel/index';
 import HistoryPanel from '../history-panel/index';
 import DanmakuPanel, { DanmakuMessage } from '../danmaku-panel/index';
 import API from '../../utils/api';
+import { copyTextToClipboard } from '../../utils/common';
 import { subscribeSSE, unsubscribeSSE, SSEMessage } from '../../utils/sse';
 import { isListSSEEnabled, setListSSEEnabled, getPollIntervalMs } from '../../utils/settings';
 import './live-list.css';
@@ -1777,10 +1778,14 @@ class LiveList extends React.Component<Props, IState> {
                                             <Space size="small" style={{ marginTop: 4 }}>
                                                 <Button
                                                     size="small"
-                                                    onClick={() => {
-                                                        navigator.clipboard.writeText(detail.recorder_status.stream_url)
-                                                            .then(() => message.success('URL 已复制'))
-                                                            .catch(() => message.error('复制失败'));
+                                                    onClick={async () => {
+                                                        // http 下自动降级为 execCommand 复制（见 utils/common）
+                                                        const copied = await copyTextToClipboard(detail.recorder_status.stream_url);
+                                                        if (copied) {
+                                                            message.success('URL 已复制');
+                                                        } else {
+                                                            message.error('复制失败，请手动选择文本后复制');
+                                                        }
                                                     }}
                                                 >
                                                     📋 复制 URL
@@ -1798,9 +1803,13 @@ class LiveList extends React.Component<Props, IState> {
                                                                 curlCmd += ` \\\n  -H '${k}: ${v}'`;
                                                             }
                                                         }
-                                                        navigator.clipboard.writeText(curlCmd)
-                                                            .then(() => message.success('curl 命令已复制'))
-                                                            .catch(() => message.error('复制失败'));
+                                                        copyTextToClipboard(curlCmd).then(copied => {
+                                                            if (copied) {
+                                                                message.success('curl 命令已复制');
+                                                            } else {
+                                                                message.error('复制失败，请手动选择文本后复制');
+                                                            }
+                                                        });
                                                     }}
                                                 >
                                                     🔧 复制为 curl

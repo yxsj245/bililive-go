@@ -28,6 +28,7 @@ video_split_strategies:
   # 有效值为正数，默认值 0 为不限制
   # 负数为非法值，程序会输出 log 提醒，并无视所设定的数值
   max_file_size: "0"
+# 录制完成后的后处理配置
 on_record_finished:
   convert_to_mp4: false
   delete_flv_after_convert: false
@@ -40,13 +41,33 @@ on_record_finished:
     upload_path_tmpl: /录播归档/{{ .Platform }}/{{ .HostName }}/{{ .FileName }}
     delete_after_upload: false
     delete_all_after_upload: false
+    upload_subtitles: false
   upload_timing: after_process
+  # 是否把同名 .ass 弹幕烧录进视频（需要 FFmpeg 带 ass 滤镜）
   burn_subtitles: false
+  # 未启用 rk3588 硬件处理时使用的软件编码器
   burn_subtitles_codec: libx264
   burn_subtitles_crf: "18"
   burn_subtitles_preset: medium
+  # 烧录成功后是否删除 ASS 弹幕文件（初始部署建议 false）
   burn_delete_ass: false
+  # 烧录成功后是否删除源视频文件（初始部署建议 false）
   burn_delete_source: false
+  rk3588:
+    # 是否启用 RK3588（MPP/RGA）硬件处理：硬件解码 + 硬件编码；关闭时完全沿用 burn_subtitles_codec
+    enable: false
+    # 自动后处理在没有弹幕文件时是否仍然压缩为 H.265（关闭则原样保留录像）
+    compress: false
+    # 硬件编码器：hevc_rkmpp（H.265，默认）或 h264_rkmpp
+    codec: hevc_rkmpp
+    # 目标码率，支持 4M / 4000k / 4000000；MPP 硬件编码不支持 CRF
+    bitrate: 4M
+    # 硬件解码不可用时是否允许软件解码（编码始终不会回退到软件编码）
+    decode_fallback: true
+    # 缩放目标宽度，0 表示不缩放；与高度必须同时为 0，或同时为 16~8192 的偶数
+    scale_width: 0
+    # 缩放目标高度，0 表示不缩放
+    scale_height: 0
 timeout_in_us: 60000000
 danmaku_enable: false
 danmaku:

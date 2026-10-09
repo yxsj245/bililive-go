@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"github.com/bililive-go/bililive-go/src/configs"
+	"github.com/bililive-go/bililive-go/src/media"
 )
 
 // 内置阶段名称常量
@@ -44,6 +45,20 @@ const (
 	OptionBurnDeleteAss = "burn_delete_ass"
 	// OptionBurnDeleteSource 烧录后是否删除源视频文件
 	OptionBurnDeleteSource = "burn_delete_source"
+	// OptionBurnEnabled 是否烧录弹幕；关闭后该阶段只做压缩（缺省视为 true，兼容历史任务数据）
+	OptionBurnEnabled = "burn_enabled"
+	// OptionCompress 无弹幕时是否仍压缩为 H.265
+	OptionCompress = "compress"
+	// OptionBitrate 硬件编码目标码率
+	OptionBitrate = "bitrate"
+	// OptionHardware 是否启用 RK3588 硬件处理链
+	OptionHardware = "hardware"
+	// OptionDecodeFallback 硬解不可用时是否允许软件解码
+	OptionDecodeFallback = "decode_fallback"
+	// OptionScaleWidth 缩放目标宽度（0 表示不缩放）
+	OptionScaleWidth = "scale_width"
+	// OptionScaleHeight 缩放目标高度（0 表示不缩放）
+	OptionScaleHeight = "scale_height"
 )
 
 // OnRecordFinishedPipeline 扩展版的录制完成后配置
@@ -114,18 +129,11 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 		})
 	}
 
-	// 弹幕字幕烧录（在 MP4 转换之后，封面提取之前）
-	if legacy.BurnSubtitles {
-		stages = append(stages, StageConfig{
-			Name: StageNameBurnSubtitles,
-			Options: map[string]any{
-				OptionCodec:           legacy.BurnSubtitlesCodec,
-				OptionCrf:             legacy.BurnSubtitlesCrf,
-				OptionPreset:          legacy.BurnSubtitlesPreset,
-				OptionBurnDeleteAss:   legacy.BurnDeleteAss,
-				OptionBurnDeleteSource: legacy.BurnDeleteSource,
-			},
-		})
+	// 弹幕字幕烧录 / 无弹幕压缩（在 MP4 转换之后，封面提取之前）
+	// 启用硬件处理时，弹幕烧录与压缩合并为同一次硬件编码；
+	// 未启用硬件处理时保持原有 libx264 + CRF 行为不变。
+	if NeedsMediaStage(legacy) {
+		stages = append(stages, BuildMediaStageConfig(legacy, false))
 	}
 
 	// 封面提取
@@ -151,6 +159,49 @@ func ConvertLegacyConfig(legacy *configs.OnRecordFinished) *PipelineConfig {
 	}
 
 	return &PipelineConfig{Stages: stages}
+}
+
+// BuildMediaStageConfig 构建"弹幕烧录 + 无弹幕压缩"合并阶段配置。
+// 自动管线与手动批量入口（batch-burn / batch-compress）共用本函数，
+// 保证两条入口生成的硬件参数完全一致。
+// forceCompress 为 true 时强制开启压缩（供手动批量压缩入口使用）。
+func BuildMediaStageConfig(legacy *configs.OnRecordFinished, forceCompress bool) StageConfig {
+	options := media.OptionsFromConfig(legacy)
+
+	burnEnabled := legacy != nil && legacy.BurnSubtitles
+	deleteAss := legacy != nil && legacy.BurnDeleteAss
+	deleteSource := legacy != nil && legacy.BurnDeleteSource
+
+	return StageConfig{
+		Name: StageNameBurnSubtitles,
+		Options: map[string]any{
+			OptionCodec:            options.Codec,
+			OptionCrf:              options.CRF,
+			OptionPreset:           options.Preset,
+			OptionBitrate:          options.Bitrate,
+			OptionHardware:         options.Enabled,
+			OptionCompress:         options.Compress || forceCompress,
+			OptionDecodeFallback:   options.DecodeFallback,
+			OptionScaleWidth:       options.ScaleWidth,
+			OptionScaleHeight:      options.ScaleHeight,
+			OptionBurnEnabled:      burnEnabled,
+			OptionBurnDeleteAss:    deleteAss,
+			OptionBurnDeleteSource: deleteSource,
+		},
+	}
+}
+
+// NeedsMediaStage 判断是否需要注册烧录/压缩阶段：
+// 启用弹幕烧录，或启用 RK3588 硬件处理并要求无弹幕压缩时都需要。
+func NeedsMediaStage(legacy *configs.OnRecordFinished) bool {
+	if legacy == nil {
+		return false
+	}
+	if legacy.BurnSubtitles {
+		return true
+	}
+	// rk3588 是指针字段：未配置时为 nil，必须用 nil 安全的方法判断
+	return legacy.RK3588.SupportsCompress()
 }
 
 // GetEffectivePipelineConfig 获取有效的 Pipeline 配置

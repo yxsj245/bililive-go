@@ -780,6 +780,15 @@ class PipelineTaskList extends Component<object, PipelineTaskListState> {
           />
         )}
 
+        {/* 手动入队任务说明 */}
+        <Alert
+          message="关于手动入队的压缩/烧录任务"
+          description="在文件列表点击「压缩」或「批量压缩」会入队到这里，压缩与烧录在同一个阶段内完成（显示为「烧录字幕」）。展开任务即可查看每个阶段的真实执行命令与日志；任务失败时保留原始文件，仅在成功后才产生压缩结果。硬件探测与自检结果不等于所有真实录像都可用。"
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+
         {/* 工具栏 */}
         <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Space>

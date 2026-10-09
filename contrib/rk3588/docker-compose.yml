@@ -1,0 +1,56 @@
+services:
+  bililive-go:
+    image: ${BILILIVE_IMAGE:-bililive-go-rk3588:20261009}
+    container_name: bililive-go
+    # 外盘容器沿用现有自动识别守护；不新建或修改守护规则。
+    restart: "no"
+    user: "${BILILIVE_UID:-1000}:${BILILIVE_GID:-1000}"
+    group_add:
+      - "${BILILIVE_VIDEO_GID:-44}"
+      - "${BILILIVE_RENDER_GID:-992}"
+    stop_grace_period: 30s
+    ports:
+      - "${BILILIVE_BIND_IP:-192.168.10.62}:${BILILIVE_PORT:-8084}:8080"
+    environment:
+      TZ: Asia/Shanghai
+      BILILIVE_DISABLE_SELF_UPDATE: "1"
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /opt/bililive/tmp_for_exec:exec,nosuid,nodev,mode=0700,uid=${BILILIVE_UID:-1000},gid=${BILILIVE_GID:-1000},size=1024m
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/mpp_service:/dev/mpp_service
+      - /dev/rga:/dev/rga
+      # 仅 DRM 分配器；不开放 NPU 的 card1/renderD129。
+      - /dev/dri/card0:/dev/dri/card0
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dma_heap/system:/dev/dma_heap/system
+      - /dev/dma_heap/system-dma32:/dev/dma_heap/system-dma32
+      - /dev/dma_heap/system-uncached:/dev/dma_heap/system-uncached
+      - /dev/dma_heap/system-uncached-dma32:/dev/dma_heap/system-uncached-dma32
+      - /dev/dma_heap/cma:/dev/dma_heap/cma
+    volumes:
+      # MPP 读取 compatible 识别 SoC，只读，不映射整套 /sys。
+      - type: bind
+        source: /sys/firmware/devicetree/base
+        target: /opt/rk3588/device-tree
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config.yml
+        target: /etc/bililive-go/config.yml
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BILILIVE_RECORD_DIR:-/media/ztl/LinuxDate/files/直播录制}
+        target: /srv/bililive
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

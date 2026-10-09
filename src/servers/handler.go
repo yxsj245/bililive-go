@@ -1942,6 +1942,10 @@ func applyConfigUpdates(c *configs.Config, updates map[string]interface{}) error
 		if deleteSource, ok := orf["burn_delete_source"].(bool); ok {
 			c.OnRecordFinished.BurnDeleteSource = deleteSource
 		}
+		// 处理 RK3588 硬件处理配置（按子字段合并，未出现的字段保持原值）
+		if err := applyRK3588Updates(c, orf); err != nil {
+			return err
+		}
 		// 处理云上传配置
 		if cloudUpload, ok := orf["cloud_upload"].(map[string]interface{}); ok {
 			if enable, ok := cloudUpload["enable"].(bool); ok {
@@ -2152,6 +2156,15 @@ func updatePlatformConfig(writer http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 写入前先校验 rk3588 覆盖，便于接口直接返回 400
+	if err := validateRK3588Override(updates, existingRK3588ForPlatform(platformKey)); err != nil {
+		writeJsonWithStatusCode(writer, http.StatusBadRequest, commonResp{
+			ErrNo:  http.StatusBadRequest,
+			ErrMsg: err.Error(),
+		})
+		return
+	}
+
 	_, err = configs.UpdateWithRetry(func(c *configs.Config) error {
 		if c.PlatformConfigs == nil {
 			c.PlatformConfigs = make(map[string]configs.PlatformConfig)
@@ -2167,7 +2180,9 @@ func updatePlatformConfig(writer http.ResponseWriter, r *http.Request) {
 			pc.MinAccessIntervalSec = int(minInterval)
 		}
 		// 使用助手函数更新可覆盖配置
-		applyOverridableConfigUpdates(&pc.OverridableConfig, updates)
+		if err := applyOverridableConfigUpdates(&pc.OverridableConfig, updates, overridableBaseOnRecordFinished(c, "")); err != nil {
+			return err
+		}
 
 		// 验证弹幕配置有效性
 		if pc.Danmaku != nil {
@@ -2245,6 +2260,15 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 	var wasNotifyOnly bool
 	inst := instance.GetInstance(r.Context())
 
+	// 写入前先校验 rk3588 覆盖，便于接口直接返回 400
+	if err := validateRK3588Override(updates, existingRK3588ForLiveID(liveId)); err != nil {
+		writeJsonWithStatusCode(writer, http.StatusBadRequest, commonResp{
+			ErrNo:  http.StatusBadRequest,
+			ErrMsg: err.Error(),
+		})
+		return
+	}
+
 	_, err = configs.UpdateWithRetry(func(c *configs.Config) error {
 		// 查找直播间（先按 LiveId，回退按 URL 计算的 hash）
 		roomIdx := -1
@@ -2297,7 +2321,9 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 		}
 
 		// 更新可覆盖配置
-		applyOverridableConfigUpdates(&room.OverridableConfig, updates)
+		if err := applyOverridableConfigUpdates(&room.OverridableConfig, updates, overridableBaseOnRecordFinished(c, configs.GetPlatformKeyFromUrl(room.Url))); err != nil {
+			return err
+		}
 
 		// 验证弹幕配置有效性（同时根据平台清理不适用的字段）
 		if room.Danmaku != nil {
@@ -2352,8 +2378,11 @@ func updateRoomConfigById(writer http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// applyOverridableConfigUpdates 统一处理可覆盖配置的更新
-func applyOverridableConfigUpdates(oc *configs.OverridableConfig, updates map[string]interface{}) {
+// applyOverridableConfigUpdates 统一处理可覆盖配置的更新。
+// baseOnRecordFinished 是该层级"当前生效"的录制后处理配置（房间级=平台覆盖或全局），
+// 用于首次创建 on_record_finished 覆盖时作为基值，避免未提交字段被零值覆盖。
+// 返回错误时调用方必须中止本次配置写入（避免写入一半的非法配置）。
+func applyOverridableConfigUpdates(oc *configs.OverridableConfig, updates map[string]interface{}, baseOnRecordFinished configs.OnRecordFinished) error {
 	if interval, ok := updates["interval"].(float64); ok {
 		val := int(interval)
 		oc.Interval = &val
@@ -2519,6 +2548,35 @@ func applyOverridableConfigUpdates(oc *configs.OverridableConfig, updates map[st
 		// 显式 null → 清除覆盖，恢复继承
 		oc.Danmaku = nil
 	}
+
+	// 处理录制完成后动作的覆盖：按子字段合并，避免只改一个字段就清掉其余覆盖
+	if orfRaw, exists := updates["on_record_finished"]; exists {
+		if orfRaw == nil {
+			// 显式 null → 清除覆盖，恢复继承全局设置
+			oc.OnRecordFinished = nil
+		} else if orfUpdates, ok := orfRaw.(map[string]interface{}); ok {
+			// 先复制再修改：CloneConfigShallow 不会深拷贝可覆盖配置里的
+			// OnRecordFinished 指针，就地修改会在校验失败时污染在线内存中的配置。
+			// 首次创建覆盖时以"当前生效配置"为基值：只提交 rk3588 的请求绝不能把
+			// burn_subtitles / cloud_upload 等未提交字段一并零值覆盖（否则房间会静默停止烧录）。
+			merged := baseOnRecordFinished
+			if oc.OnRecordFinished != nil {
+				merged = *oc.OnRecordFinished
+			}
+			if err := applyOnRecordFinishedOverride(&merged, orfUpdates); err != nil {
+				return err
+			}
+			// 与基值等价（典型场景：把 rk3588 置回继承）时删除覆盖，真正恢复继承上层设置，
+			// 避免残留一个仅用于 rk3588 的零值覆盖结构。
+			if onRecordFinishedOverrideIsRedundant(merged, baseOnRecordFinished) {
+				oc.OnRecordFinished = nil
+			} else {
+				oc.OnRecordFinished = &merged
+			}
+		}
+	}
+
+	return nil
 }
 
 // updateRoomConfig 更新直播间配置
@@ -2554,6 +2612,15 @@ func updateRoomConfig(writer http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 写入前先校验 rk3588 覆盖，便于接口直接返回 400
+	if err := validateRK3588Override(updates, existingRK3588ForRoomUrl(decodedUrl)); err != nil {
+		writeJsonWithStatusCode(writer, http.StatusBadRequest, commonResp{
+			ErrNo:  http.StatusBadRequest,
+			ErrMsg: err.Error(),
+		})
+		return
+	}
+
 	_, err = configs.UpdateWithRetry(func(c *configs.Config) error {
 		room, err := c.GetLiveRoomByUrl(decodedUrl)
 		if err != nil {
@@ -2575,7 +2642,9 @@ func updateRoomConfig(writer http.ResponseWriter, r *http.Request) {
 		}
 
 		// 处理可覆盖配置（弹幕、interval、outPutPath、ffmpegPath 等）
-		applyOverridableConfigUpdates(&room.OverridableConfig, updates)
+		if err := applyOverridableConfigUpdates(&room.OverridableConfig, updates, overridableBaseOnRecordFinished(c, configs.GetPlatformKeyFromUrl(room.Url))); err != nil {
+			return err
+		}
 
 		// 验证弹幕配置（同时根据平台清理不适用的字段）
 		if room.Danmaku != nil {

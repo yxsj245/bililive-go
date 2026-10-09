@@ -1,0 +1,22 @@
+// 只创建调试目录，使用零直播间配置；运行测试不依赖业务录像。
+const fs = require('fs');
+const path = require('path');
+const yaml = require('../../src/webapp/node_modules/js-yaml');
+const base = process.env.MEDIA_BUILD_CONTEXT || '/opt/Code/rk3588-media-build';
+const output = path.join(base, 'api-smoke');
+fs.mkdirSync(output, { recursive: true });
+for (const name of ['burn', 'plain', 'invalid', 'logs']) fs.mkdirSync(path.join(output, name), { recursive: true });
+const config = yaml.load(fs.readFileSync(path.join(base, 'staging/config.yml'), 'utf8'));
+config.live_rooms = [];
+config.log.out_put_folder = '/srv/bililive/logs';
+config.out_put_path = '/srv/bililive';
+config.app_data_path = '/srv/bililive/.appdata';
+config.on_record_finished.fix_flv_at_first = false;
+config.on_record_finished.save_cover = false;
+fs.writeFileSync(path.join(base, 'smoke-config.yml'), yaml.dump(config, { lineWidth: -1 }), { mode: 0o600 });
+for (const name of ['burn', 'plain']) fs.copyFileSync(path.join(base, 'smoke/source.mp4'), path.join(output, name, 'source.mp4'));
+fs.copyFileSync(path.join(base, 'smoke/source.ass'), path.join(output, 'burn/source.ass'));
+fs.writeFileSync(path.join(output, 'invalid/broken.mp4'), '用于验证失败保留的损坏输入。');
+const escaped = path.join(output, 'escape.mp4');
+if (!fs.lstatSync(escaped, { throwIfNoEntry: false })) fs.symlinkSync('/opt/rk3588/versions.txt', escaped);
+console.log('隔离调试配置与素材已准备；直播间为空，不访问业务录像。');

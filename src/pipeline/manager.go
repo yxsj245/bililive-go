@@ -17,6 +17,7 @@ import (
 	"github.com/bililive-go/bililive-go/src/pkg/events"
 	"github.com/bililive-go/bililive-go/src/pkg/livelogger"
 	bilisentry "github.com/bililive-go/bililive-go/src/pkg/sentry"
+	"github.com/bililive-go/bililive-go/src/pkg/utils"
 	"github.com/bililive-go/bililive-go/src/types"
 	"github.com/sirupsen/logrus"
 )
@@ -208,6 +209,8 @@ func (m *Manager) executeTask(ctx context.Context, task *PipelineTask) {
 			"room":     task.RecordInfo.RoomName,
 		}),
 		WorkDir: "", // 后续可以从配置获取
+		// 按任务所属房间解析 FFmpeg 路径：房间级/平台级 ffmpeg_path 覆盖必须对后处理生效
+		FFmpegPath: resolveTaskFFmpegPath(ctx, task.RecordInfo),
 	}
 
 	// 执行管道（从 startStage 开始，支持从指定阶段重试）
@@ -746,6 +749,48 @@ func inferUploadPathInfo(relPath string) (platform, hostName string) {
 	}
 
 	return platform, hostName
+}
+
+// resolveTaskFFmpegPath 解析任务应使用的 FFmpeg 路径。
+// 优先使用任务所属房间的有效配置（含房间级/平台级 ffmpeg_path 覆盖），
+// 未配置时回退到全局查找逻辑（配置 → remotetools → 系统 PATH）。
+func resolveTaskFFmpegPath(ctx context.Context, recordInfo RecordInfo) string {
+	cfg := configs.GetCurrentConfig()
+	if path := effectiveFFmpegPathForTask(cfg, recordInfo); strings.TrimSpace(path) != "" {
+		return path
+	}
+	resolved, err := utils.GetFFmpegPath(ctx)
+	if err != nil {
+		logrus.WithError(err).Debug("resolve ffmpeg path for pipeline task failed")
+		return ""
+	}
+	return resolved
+}
+
+// effectiveFFmpegPathForTask 返回任务所属房间的有效 FFmpeg 路径（独立函数便于测试）
+func effectiveFFmpegPathForTask(cfg *configs.Config, recordInfo RecordInfo) string {
+	if cfg == nil {
+		return ""
+	}
+	room := findLiveRoomByID(cfg, recordInfo.LiveID)
+	if room == nil {
+		return cfg.FfmpegPath
+	}
+	platformKey := configs.GetPlatformKeyFromUrl(room.Url)
+	return cfg.ResolveConfigForRoom(room, platformKey).FfmpegPath
+}
+
+// findLiveRoomByID 按 LiveId 查找房间配置（批量任务等无对应房间时返回 nil）
+func findLiveRoomByID(cfg *configs.Config, liveID types.LiveID) *configs.LiveRoom {
+	if cfg == nil || liveID == "" {
+		return nil
+	}
+	for i := range cfg.LiveRooms {
+		if cfg.LiveRooms[i].LiveId == liveID {
+			return &cfg.LiveRooms[i]
+		}
+	}
+	return nil
 }
 
 // GetManager 从实例获取管道管理器

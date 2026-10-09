@@ -102,6 +102,26 @@ func DecorateConfigNode(node *yaml.Node) {
 # 如果不想让下载流量走代理，可以将此项的 enable 设为 false`, "")
 	}
 
+	// 录制完成后处理配置注释
+	setFieldHeadComment(root, "on_record_finished", "# 录制完成后的后处理配置")
+	onRecordFinishedNode := findNode(root, "on_record_finished")
+	if onRecordFinishedNode != nil {
+		setFieldComment(onRecordFinishedNode, "burn_subtitles", "# 是否把同名 .ass 弹幕烧录进视频（需要 FFmpeg 带 ass 滤镜）", "")
+		setFieldComment(onRecordFinishedNode, "burn_subtitles_codec", "# 未启用 rk3588 硬件处理时使用的软件编码器", "")
+		setFieldComment(onRecordFinishedNode, "burn_delete_ass", "# 烧录成功后是否删除 ASS 弹幕文件（初始部署建议 false）", "")
+		setFieldComment(onRecordFinishedNode, "burn_delete_source", "# 烧录成功后是否删除源视频文件（初始部署建议 false）", "")
+		rk3588Node := findNode(onRecordFinishedNode, "rk3588")
+		if rk3588Node != nil {
+			setFieldComment(rk3588Node, "enable", "# 是否启用 RK3588（MPP/RGA）硬件处理：硬件解码 + 硬件编码；关闭时完全沿用 burn_subtitles_codec", "")
+			setFieldComment(rk3588Node, "compress", "# 自动后处理在没有弹幕文件时是否仍然压缩为 H.265（关闭则原样保留录像）", "")
+			setFieldComment(rk3588Node, "codec", "# 硬件编码器：hevc_rkmpp（H.265，默认）或 h264_rkmpp", "")
+			setFieldComment(rk3588Node, "bitrate", "# 目标码率，支持 4M / 4000k / 4000000；MPP 硬件编码不支持 CRF", "")
+			setFieldComment(rk3588Node, "decode_fallback", "# 硬件解码不可用时是否允许软件解码（编码始终不会回退到软件编码）", "")
+			setFieldComment(rk3588Node, "scale_width", "# 缩放目标宽度，0 表示不缩放；与高度必须同时为 0，或同时为 16~8192 的偶数", "")
+			setFieldComment(rk3588Node, "scale_height", "# 缩放目标高度，0 表示不缩放", "")
+		}
+	}
+
 	// Feature 功能配置注释
 	featureNode := findNode(root, "feature")
 	if featureNode != nil {

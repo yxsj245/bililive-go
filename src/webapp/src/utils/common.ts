@@ -37,6 +37,58 @@ function customFetch(arg1: Parameters<typeof fetch>[0], ...args: any[]) {
     });
 }
 
+/**
+ * 复制文本到剪贴板
+ *
+ * 兼容说明：页面在 http（非安全上下文）下没有 navigator.clipboard，
+ * 直接调用会抛错，因此统一走本函数：优先 Clipboard API，失败时降级为
+ * document.execCommand('copy')，保证 http 场景复制按钮仍可用。
+ * @param text 待复制文本
+ * @returns 是否复制成功
+ */
+export async function copyTextToClipboard(text: string): Promise<boolean> {
+    if (!text) {
+        return false;
+    }
+    // 优先使用 Clipboard API（仅安全上下文可用）
+    if (
+        typeof navigator !== 'undefined'
+        && navigator.clipboard
+        && typeof navigator.clipboard.writeText === 'function'
+    ) {
+        try {
+            await navigator.clipboard.writeText(text);
+            return true;
+        } catch {
+            // 失败后继续尝试降级方案
+        }
+    }
+    return execCommandCopy(text);
+}
+
+/** 降级复制实现：临时 textarea + document.execCommand('copy')，在 http 下同样可用 */
+function execCommandCopy(text: string): boolean {
+    try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', 'readonly');
+        textarea.style.position = 'fixed';
+        textarea.style.top = '0';
+        textarea.style.left = '0';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        textarea.setSelectionRange(0, textarea.value.length);
+        const copied = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        return copied;
+    } catch (error) {
+        console.error('复制到剪贴板失败:', error);
+        return false;
+    }
+}
+
 class Utils {
     /**
      * Get request

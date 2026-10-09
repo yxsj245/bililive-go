@@ -171,6 +171,32 @@ class API {
     }
 
     /**
+     * 批量硬件压缩视频文件（RK3588）
+     * 返回 { enqueued, skipped, task_ids }
+     * @param paths 视频文件路径列表
+     */
+    batchCompressFiles(paths: string[]) {
+        return utils.requestPost(`${BASE_URL}/pipeline/batch-compress`, { paths });
+    }
+
+    /**
+     * 压缩单个视频文件（复用批量压缩接口，只提交一个路径）
+     * @param path 视频文件路径
+     */
+    compressFile(path: string) {
+        return utils.requestPost(`${BASE_URL}/pipeline/batch-compress`, { paths: [path] });
+    }
+
+    /**
+     * 获取硬件（RK3588 / FFmpeg）探测与自检状态
+     * 注意：探测结果不代表所有真实录像均可用，可用性以后端真实编解码自检为准
+     * @param refresh 是否强制后端重新自检（?refresh=1）
+     */
+    getHardwareStatus(refresh: boolean = false) {
+        return utils.requestGet(`${BASE_URL}/hardware/status${refresh ? '?refresh=1' : ''}`);
+    }
+
+    /**
      * 上传单个文件到云盘
      * @param path 文件路径
      */

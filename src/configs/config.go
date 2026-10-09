@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -374,6 +375,146 @@ type OnRecordFinished struct {
 	BurnSubtitlesPreset   string       `yaml:"burn_subtitles_preset" json:"burn_subtitles_preset"`           // 烧录用编码预设，默认 medium
 	BurnDeleteAss         bool         `yaml:"burn_delete_ass" json:"burn_delete_ass"`                       // 烧录后删除 ASS 文件
 	BurnDeleteSource      bool         `yaml:"burn_delete_source" json:"burn_delete_source"`                 // 烧录后删除源视频文件
+	RK3588                *RK3588Config `yaml:"rk3588,omitempty" json:"rk3588,omitempty"`               // RK3588 硬件处理（弹幕烧录与无弹幕压缩共用一条硬件处理链）；房间/平台级为 nil 时继承全局
+}
+
+// RK3588 硬件编码器名称。这里使用字面量而不是引用 media 包，避免 configs 与 media 形成循环依赖。
+const (
+	// RK3588CodecHEVC H.265 硬件编码器
+	RK3588CodecHEVC = "hevc_rkmpp"
+	// RK3588CodecH264 H.264 硬件编码器
+	RK3588CodecH264 = "h264_rkmpp"
+)
+
+// RK3588Config RK3588（MPP/RGA）硬件处理配置。
+// 弹幕烧录与无弹幕压缩合并为同一条硬件处理链，只编码一次，避免二次转码损失画质。
+// 该字段是指针：nil 表示"未配置"，房间/平台级覆盖为 nil 时继承全局设置。
+type RK3588Config struct {
+	Enable         bool   `yaml:"enable" json:"enable"`                   // 是否启用硬件处理
+	Compress       bool   `yaml:"compress" json:"compress"`               // 无弹幕时是否仍压缩为 H.265
+	Codec          string `yaml:"codec" json:"codec"`                     // 硬件编码器：hevc_rkmpp / h264_rkmpp
+	Bitrate        string `yaml:"bitrate" json:"bitrate"`                 // 目标码率，默认 4M
+	DecodeFallback bool   `yaml:"decode_fallback" json:"decode_fallback"` // 硬解不可用时是否允许软件解码（编码始终不回退软件编码）
+	ScaleWidth     int    `yaml:"scale_width" json:"scale_width"`         // 缩放目标宽度，0 表示不缩放
+	ScaleHeight    int    `yaml:"scale_height" json:"scale_height"`       // 缩放目标高度，0 表示不缩放
+}
+
+// defaultRK3588Config RK3588 硬件处理的默认值。默认不启用，避免影响既有部署。
+var defaultRK3588Config = RK3588Config{
+	Enable:         false,
+	Compress:       false,
+	Codec:          RK3588CodecHEVC,
+	Bitrate:        "4M",
+	DecodeFallback: true,
+	ScaleWidth:     0,
+	ScaleHeight:    0,
+}
+
+// DefaultRK3588Config 返回默认配置的副本。
+// 返回独立副本而不是共享指针，避免某个配置实例的就地修改影响其它实例。
+func DefaultRK3588Config() *RK3588Config {
+	clone := defaultRK3588Config
+	return &clone
+}
+
+// CloneWithDefaults 返回补齐默认值后的副本（编码器与码率为空时填默认值）。
+// 接收者为 nil 时返回默认配置副本；用于全局配置与"已显式覆盖"的房间/平台级配置。
+func (r *RK3588Config) CloneWithDefaults() *RK3588Config {
+	clone := DefaultRK3588Config()
+	if r != nil {
+		*clone = *r
+	}
+	if strings.TrimSpace(clone.Codec) == "" {
+		clone.Codec = defaultRK3588Config.Codec
+	}
+	if strings.TrimSpace(clone.Bitrate) == "" {
+		clone.Bitrate = defaultRK3588Config.Bitrate
+	}
+	return clone
+}
+
+// IsEnabled 返回是否启用硬件处理（未配置时视为未启用）
+func (r *RK3588Config) IsEnabled() bool {
+	return r != nil && r.Enable
+}
+
+// SupportsCompress 返回是否启用"无弹幕也压缩"（需同时启用硬件处理）
+func (r *RK3588Config) SupportsCompress() bool {
+	return r != nil && r.Enable && r.Compress
+}
+
+// DecodeFallbackEnabled 返回硬解失败时是否允许软件解码回退（默认 true）
+func (r *RK3588Config) DecodeFallbackEnabled() bool {
+	return r == nil || r.DecodeFallback
+}
+
+// ValidateRK3588 校验硬件处理配置，r 为 nil 表示未配置（合法）。
+// 未启用硬件处理时只做宽松校验，避免历史配置中残留的编码器名称导致配置无法保存。
+func ValidateRK3588(r *RK3588Config) error {
+	if r == nil {
+		return nil
+	}
+	if err := ValidateScaleSize(r.ScaleWidth, r.ScaleHeight); err != nil {
+		return err
+	}
+	if !r.Enable {
+		return nil
+	}
+	switch codec := strings.TrimSpace(r.Codec); codec {
+	case "", RK3588CodecHEVC, RK3588CodecH264:
+	default:
+		return fmt.Errorf("硬件编码器仅支持 %s 或 %s，当前为 %s", RK3588CodecHEVC, RK3588CodecH264, codec)
+	}
+	if _, err := ParseBitrate(r.Bitrate); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ParseBitrate 解析码率字符串（支持 4M / 4000k / 4000000 等写法），返回比特每秒
+func ParseBitrate(value string) (int64, error) {
+	text := strings.ToLower(strings.TrimSpace(value))
+	if text == "" {
+		return 0, fmt.Errorf("码率不能为空（示例: 4M）")
+	}
+	multiplier := int64(1)
+	switch {
+	case strings.HasSuffix(text, "k"):
+		multiplier = 1000
+		text = strings.TrimSuffix(text, "k")
+	case strings.HasSuffix(text, "m"):
+		multiplier = 1000 * 1000
+		text = strings.TrimSuffix(text, "m")
+	}
+	number, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+	if err != nil {
+		return 0, fmt.Errorf("码率格式无效: %s（示例: 4M / 4000k / 4000000）", value)
+	}
+	if number <= 0 {
+		return 0, fmt.Errorf("码率必须大于 0: %s", value)
+	}
+	bits := int64(number * float64(multiplier))
+	if bits < 10*1000 || bits > 200*1000*1000 {
+		return 0, fmt.Errorf("码率超出合理范围（10k~200M）: %s", value)
+	}
+	return bits, nil
+}
+
+// ValidateScaleSize 校验缩放目标尺寸：必须同时为 0（不缩放），或同时为 16~8192 之间的偶数
+func ValidateScaleSize(width, height int) error {
+	if width == 0 && height == 0 {
+		return nil
+	}
+	if width <= 0 || height <= 0 {
+		return fmt.Errorf("缩放宽度与高度必须同时配置（当前 %d x %d）", width, height)
+	}
+	if width%2 != 0 || height%2 != 0 {
+		return fmt.Errorf("缩放宽度与高度必须为偶数（YUV420 编码要求，当前 %d x %d）", width, height)
+	}
+	if width < 16 || height < 16 || width > 8192 || height > 8192 {
+		return fmt.Errorf("缩放尺寸需在 16~8192 之间（当前 %d x %d）", width, height)
+	}
+	return nil
 }
 
 type Log struct {
@@ -1059,6 +1200,7 @@ var defaultConfig = Config{
 		BurnSubtitlesPreset: "medium",
 		BurnDeleteAss:       false,
 		BurnDeleteSource:    false,
+		RK3588:              DefaultRK3588Config(),
 	},
 	TimeoutInUs: 60000000,
 	Danmaku:     defaultDanmakuConfig,
@@ -1110,6 +1252,8 @@ func NewConfig() *Config {
 	config := defaultConfig
 	config.liveRoomIndexCache = map[string]int{}
 	config.PlatformConfigs = map[string]PlatformConfig{}
+	// rk3588 是指针字段：defaultConfig 中的指针会被所有配置实例共享，必须换成独立副本
+	config.OnRecordFinished.RK3588 = config.OnRecordFinished.RK3588.CloneWithDefaults()
 	newConfigPostProcess(&config)
 	return &config
 }
@@ -1121,6 +1265,21 @@ func newConfigPostProcess(c *Config) {
 	}
 	if c.AppDataPath == "" {
 		c.AppDataPath = filepath.Join(c.OutPutPath, ".appdata")
+	}
+	// 全局配置补齐 rk3588 默认值（房间/平台级为 nil 时表示继承全局）
+	c.OnRecordFinished.RK3588 = c.OnRecordFinished.RK3588.CloneWithDefaults()
+	// 房间级覆盖里已显式配置的 rk3588 只补齐编码器/码率，保留其余字段的原样取值
+	for i := range c.LiveRooms {
+		if orf := c.LiveRooms[i].OnRecordFinished; orf != nil && orf.RK3588 != nil {
+			orf.RK3588 = orf.RK3588.CloneWithDefaults()
+		}
+	}
+	// 平台级覆盖同理
+	for key, platformConfig := range c.PlatformConfigs {
+		if platformConfig.OnRecordFinished != nil && platformConfig.OnRecordFinished.RK3588 != nil {
+			platformConfig.OnRecordFinished.RK3588 = platformConfig.OnRecordFinished.RK3588.CloneWithDefaults()
+			c.PlatformConfigs[key] = platformConfig
+		}
 	}
 	// 规范化手动编辑配置写入的别名域名房间（如 m.douyu.com → www.douyu.com），
 	// 保证 cookies/平台配置按统一 host 命中。LiveId 是不持久化的瞬时字段（yaml:"-"），
@@ -1286,6 +1445,11 @@ func (c *Config) Verify() error {
 		return fmt.Errorf("弹幕配置无效: %w", err)
 	}
 
+	// 验证 RK3588 硬件处理配置
+	if err := ValidateRK3588(c.OnRecordFinished.RK3588); err != nil {
+		return fmt.Errorf("RK3588 硬件处理配置无效: %w", err)
+	}
+
 	// 验证 OpenList 配置
 	if c.OnRecordFinished.CloudUpload.Enable {
 		if c.OpenList.Port < 0 || c.OpenList.Port > 65535 {
@@ -1338,6 +1502,9 @@ func NewConfigWithBytes(b []byte) (*Config, error) {
 	// 不换新 map 的话，下面 RefreshLiveRoomIndexCache 会直接改写全局默认配置的缓存，
 	// 让所有配置实例共享一张被并发读写的 map。
 	config.liveRoomIndexCache = map[string]int{}
+	// rk3588 是指针字段：yaml 解码会就地写入该指针指向的结构体，
+	// 不先换成独立副本就会改写包级 defaultConfig（污染后续所有配置实例）
+	config.OnRecordFinished.RK3588 = config.OnRecordFinished.RK3588.CloneWithDefaults()
 	if err := yaml.Unmarshal(b, &config); err != nil {
 		return nil, err
 	}
@@ -1711,7 +1878,13 @@ func (r *ResolvedConfig) applyOverrides(override *OverridableConfig) {
 		r.VideoSplitStrategies = *override.VideoSplitStrategies
 	}
 	if override.OnRecordFinished != nil {
-		r.OnRecordFinished = *override.OnRecordFinished
+		overrideOnRecordFinished := *override.OnRecordFinished
+		// rk3588 为指针字段：房间/平台级未设置（nil）时继承全局硬件处理设置，
+		// 避免"只覆盖了转 mp4"的房间把硬件处理整段置空。
+		if overrideOnRecordFinished.RK3588 == nil {
+			overrideOnRecordFinished.RK3588 = r.OnRecordFinished.RK3588
+		}
+		r.OnRecordFinished = overrideOnRecordFinished
 	}
 	if override.TimeoutInUs != nil {
 		r.TimeoutInUs = *override.TimeoutInUs

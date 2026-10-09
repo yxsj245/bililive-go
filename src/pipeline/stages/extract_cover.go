@@ -65,8 +65,18 @@ func (s *ExtractCoverStage) Execute(ctx *pipeline.PipelineContext, input []pipel
 
 		ctx.Logger.Infof("提取封面: %s", file.Path)
 
-		// 提取封面
-		coverPath, err := tools.ExtractCover(ctx.Ctx, file.Path)
+		// 提取封面：使用与烧录/压缩相同的 FFmpeg 路径（含房间级 ffmpeg_path 覆盖），
+		// 并记录实际执行的命令与软件回退情况
+		coverPath, err := tools.ExtractCoverWithOptions(ctx.Ctx, file.Path, "", tools.CoverOptions{
+			FFmpegPath: ctx.FFmpegPath,
+			OnCommand: func(command string, fallback bool) {
+				s.commands = append(s.commands, command)
+				if fallback {
+					s.logs += "封面提取回退软件 JPEG: " + command + "\n"
+					ctx.Logger.Warnf("封面提取回退软件 JPEG: %s", command)
+				}
+			},
+		})
 		if err != nil {
 			s.logs += fmt.Sprintf("提取封面失败: %s - %s\n", filepath.Base(file.Path), err.Error())
 			ctx.Logger.Warnf("提取封面失败: %s - %s", file.Path, err)

@@ -1,0 +1,22 @@
+# 固定基础镜像与上游源码提交，宿主机不安装或替换任何多媒体库。
+ARG BASE_IMAGE=ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+FROM ${BASE_IMAGE} AS builder
+ARG FFMPEG_REV=d90e3a1c18d7929383cf88c1b3da2e2d1c966cbf
+ARG MPP_REV=14729dd578e570e5f00fd1dd2113f5429012d64b
+ARG RGA_REV=2b32edcb97b601b25683e2941d888c8515da6d55
+ARG BUILD_JOBS=8
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential cmake pkg-config git ca-certificates libass-dev libdrm-dev libssl-dev libx264-dev && apt-get clean
+COPY sources/ /sources/
+RUN test "$(git -C /sources/ffmpeg rev-parse HEAD)" = "$FFMPEG_REV" && test "$(git -C /sources/mpp rev-parse HEAD)" = "$MPP_REV" && test "$(git -C /sources/rga rev-parse HEAD)" = "$RGA_REV"
+COPY patches/mpp-container.patch /tmp/mpp-container.patch
+RUN git -C /sources/mpp apply /tmp/mpp-container.patch
+RUN cmake -S /sources/mpp -B /tmp/mpp-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/rk3588 -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_TEST=OFF && cmake --build /tmp/mpp-build -j${BUILD_JOBS} && cmake --install /tmp/mpp-build
+RUN mkdir -p /opt/rk3588/include/rga /opt/rk3588/lib/pkgconfig && cp /sources/rga/include/* /opt/rk3588/include/rga/ && cp /sources/rga/libs/Linux/gcc-aarch64/librga.so /opt/rk3588/lib/ && ln -s librga.so /opt/rk3588/lib/librga.so.2 && printf 'prefix=/opt/rk3588\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: librga\nDescription: Rockchip RGA\nVersion: 1.10.6\nLibs: -L${libdir} -lrga\nCflags: -I${includedir}/rga\n' > /opt/rk3588/lib/pkgconfig/librga.pc
+WORKDIR /sources/ffmpeg
+RUN PKG_CONFIG_PATH=/opt/rk3588/lib/pkgconfig ./configure --prefix=/opt/rk3588 --enable-gpl --enable-version3 --enable-libdrm --enable-rkmpp --enable-rkrga --enable-libass --enable-openssl --enable-libx264 --disable-debug --disable-doc --disable-ffplay --extra-ldflags='-Wl,-rpath,/opt/rk3588/lib' && make -j${BUILD_JOBS} && make install
+RUN mkdir -p /opt/rk3588/licenses && cp /sources/ffmpeg/COPYING* /opt/rk3588/licenses/ && cp /sources/rga/COPYING /opt/rk3588/licenses/RGA-COPYING && cp -r /sources/mpp/LICENSES /opt/rk3588/licenses/MPP-LICENSES && printf 'ffmpeg=%s\nmpp=%s\nrga=%s\n' "$FFMPEG_REV" "$MPP_REV" "$RGA_REV" > /opt/rk3588/versions.txt
+FROM ${BASE_IMAGE} AS media-runtime
+ENV PATH=/opt/rk3588/bin:$PATH LD_LIBRARY_PATH=/opt/rk3588/lib TZ=Asia/Shanghai
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libass9 libdrm2 libssl3t64 libx264-164 libstdc++6 libatomic1 ca-certificates fontconfig fonts-noto-cjk curl tzdata && apt-get clean
+COPY --from=builder /opt/rk3588/ /opt/rk3588/
+RUN /opt/rk3588/bin/ffmpeg -version && /opt/rk3588/bin/ffprobe -version && fc-match 'Noto Sans CJK SC'

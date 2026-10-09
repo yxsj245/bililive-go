@@ -13,10 +13,19 @@ import {
     // @ts-ignore
     DeleteOutlined,
     // @ts-ignore
-    CloudUploadOutlined
+    CloudUploadOutlined,
+    // @ts-ignore
+    CompressOutlined
 } from "@ant-design/icons";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import Utils from "../../utils/common";
+import {
+    RK3588_DELETE_SOURCE_WARNING,
+    RK3588_KEEP_SOURCE_HINT_OFF,
+    describeRk3588Config,
+    normalizeRk3588Config,
+} from "../../types/hardware";
+import { fetchHardwareStatus } from "../config-info/HardwareStatusCard";
 import './file-list.css';
 import Artplayer from "artplayer";
 import mpegtsjs from "mpegts.js";
@@ -520,6 +529,8 @@ const FileList: React.FC = () => {
     const [batchFind, setBatchFind] = useState("");
     const [batchReplace, setBatchReplace] = useState("");
     const [batchBurning, setBatchBurning] = useState(false);
+    const [batchCompressing, setBatchCompressing] = useState(false);
+    const [compressingFile, setCompressingFile] = useState("");
 
     // 当弹窗打开时，自动聚焦到输入框
     useEffect(() => {
@@ -1004,6 +1015,159 @@ const FileList: React.FC = () => {
         };
     };
 
+    // ==================== RK3588 硬件压缩 ====================
+
+    // 计算选中文件中可压缩的视频数量
+    const getCompressibleCount = (): number => {
+        return currentFolderFiles.filter(f =>
+            selectedRowKeys.includes(f.name) && !f.is_folder && isVideoFileName(f.name)
+        ).length;
+    };
+
+    // 文件列表中的名称 -> 接口所需路径
+    const toFilePath = (name: string): string => (pathParam ? `${pathParam}/${name}` : name);
+
+    /**
+     * 读取当前生效的压缩参数与硬件探测状态
+     * 两者互不依赖，并行获取；任一失败都降级处理，不阻塞压缩入口
+     */
+    const loadCompressContext = async () => {
+        const [effective, hardware] = await Promise.all([
+            api.getEffectiveConfig().catch(() => null),
+            fetchHardwareStatus()
+        ]);
+        const onRecordFinished = (effective as any)?.on_record_finished ?? null;
+        const raw = onRecordFinished?.rk3588 ?? null;
+        return {
+            config: raw ? normalizeRk3588Config(raw) : null,
+            hardware,
+            // 成功后是否删除源文件由这两个既有开关决定，确认框必须如实显示
+            burnDeleteSource: !!onRecordFinished?.burn_delete_source,
+            burnDeleteAss: !!onRecordFinished?.burn_delete_ass,
+        };
+    };
+
+    /** 压缩前需要展示的上下文：当前生效配置 + 硬件探测/自检状态 */
+    type CompressContext = Awaited<ReturnType<typeof loadCompressContext>>;
+
+    // 中文确认后提交压缩任务（真实执行命令与日志在队列页面查看）
+    const showCompressConfirm = (
+        paths: string[],
+        selectedNames: string[],
+        context: CompressContext
+    ): Promise<void> => {
+        if (paths.length === 0) {
+            message.info("选中的文件中没有可压缩的视频文件");
+            return Promise.resolve();
+        }
+        const { config, hardware, burnDeleteSource, burnDeleteAss } = context;
+        const enableOn = !!config?.enable;
+        const confirmContent = (
+            <div style={{ fontSize: 13 }}>
+                <div>将对 {paths.length} 个视频执行压缩：</div>
+                <div style={{ marginTop: 6, maxHeight: 120, overflow: 'auto', color: '#8c8c8c', fontSize: 12 }}>
+                    {selectedNames.join('、')}
+                </div>
+                <div style={{ marginTop: 8 }}>
+                    当前压缩参数：{config ? describeRk3588Config(config) : '未读取到配置（按后端默认执行）'}
+                </div>
+                {!enableOn && (
+                    <div style={{ marginTop: 8, color: '#d46b08' }}>
+                        提示：硬件路径当前未开启（enable=false），手动压缩要求先开启。请在「设置 → 全局设置 → RK3588 硬件压缩」中打开「启用 RK3588 硬件路径」，否则可能无法压缩。
+                    </div>
+                )}
+                {hardware && !hardware.available && (
+                    <div style={{ marginTop: 8, color: '#d46b08' }}>
+                        提示：硬件状态为不可用（真实编解码自检未通过），任务可能失败并回退软解；自检结果不等于所有真实录像都可用，请以队列页任务的执行命令与日志为准。
+                    </div>
+                )}
+                <div style={{ marginTop: 8 }}>
+                    有同名 ASS 弹幕字幕时，本次任务会按当前配置一次性完成烧录与压缩。
+                    {burnDeleteAss ? '（当前已开启「烧录后删除 ASS 文件」）' : ''}
+                </div>
+                <div style={{ marginTop: 8, color: burnDeleteSource ? '#d46b08' : undefined }}>
+                    {burnDeleteSource ? RK3588_DELETE_SOURCE_WARNING : RK3588_KEEP_SOURCE_HINT_OFF}
+                </div>
+                <div style={{ marginTop: 4, color: '#8c8c8c', fontSize: 12 }}>
+                    提交后可在「队列」页面查看真实执行命令与日志；任务失败时一定保留原件。
+                </div>
+            </div>
+        );
+
+        return new Promise<void>(resolve => {
+            Modal.confirm({
+                title: paths.length > 1 ? '批量压缩视频（RK3588）' : '压缩视频（RK3588）',
+                content: confirmContent,
+                okText: '开始压缩',
+                cancelText: '取消',
+                onOk: async () => {
+                    try {
+                        const rsp: any = await api.batchCompressFiles(paths);
+                        const enqueued = rsp?.enqueued ?? rsp?.data?.enqueued ?? 0;
+                        const skipped: string[] = rsp?.skipped ?? rsp?.data?.skipped ?? [];
+                        if (enqueued > 0) {
+                            message.success(`已入队 ${enqueued} 个压缩任务，可在「队列」页面查看执行命令与日志`, 6);
+                        }
+                        if (skipped.length > 0) {
+                            Modal.info({
+                                title: enqueued > 0 ? '部分文件已跳过' : '未能入队',
+                                content: (
+                                    <div style={{ maxHeight: 300, overflow: 'auto' }}>
+                                        {skipped.map((s, i) => (
+                                            <div key={i} style={{ fontSize: '12px', color: '#8c8c8c' }}>{s}</div>
+                                        ))}
+                                    </div>
+                                ),
+                            });
+                        }
+                        if (enqueued === 0 && skipped.length === 0) {
+                            message.warning('压缩任务未入队，请稍后重试');
+                        }
+                        setSelectedRowKeys([]);
+                    } catch (err: any) {
+                        message.error('压缩请求失败: ' + (err?.message || err));
+                    } finally {
+                        resolve();
+                    }
+                },
+                onCancel: () => resolve(),
+            });
+        });
+    };
+
+    // 单个文件压缩
+    const handleCompressFile = async (record: CurrentFolderFile, e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (!isVideoFileName(record.name)) {
+            message.info("仅支持压缩视频文件");
+            return;
+        }
+        setCompressingFile(record.name);
+        const context = await loadCompressContext();
+        setCompressingFile("");
+        await showCompressConfirm([toFilePath(record.name)], [record.name], context);
+    };
+
+    // 批量压缩
+    const handleBatchCompress = async () => {
+        if (selectedRowKeys.length === 0 || batchCompressing) return;
+        const selectedFiles = currentFolderFiles.filter(f =>
+            selectedRowKeys.includes(f.name) && !f.is_folder && isVideoFileName(f.name)
+        );
+        if (selectedFiles.length === 0) {
+            message.info("选中的文件中没有可压缩的视频文件");
+            return;
+        }
+        setBatchCompressing(true);
+        const context = await loadCompressContext();
+        setBatchCompressing(false);
+        await showCompressConfirm(
+            selectedFiles.map(f => toFilePath(f.name)),
+            selectedFiles.map(f => f.name),
+            context
+        );
+    };
+
     const onRowClick = (record: CurrentFolderFile) => {
         // 保持使用原始字符串进行拼接
         let fullPath = record.name;
@@ -1254,7 +1418,7 @@ const FileList: React.FC = () => {
         }, {
             title: "操作",
             key: "action",
-            width: 200,
+            width: 280,
             render: (text: any, record: CurrentFolderFile) => (
                 <Space size="small" onClick={(e) => e.stopPropagation()}>
                     <Button
@@ -1277,6 +1441,19 @@ const FileList: React.FC = () => {
                             className="action-btn"
                         >
                             上传
+                        </Button>
+                    )}
+                    {!record.is_folder && isVideoFileName(record.name) && (
+                        <Button
+                            type="link"
+                            size="small"
+                            // @ts-ignore
+                            icon={<CompressOutlined />}
+                            loading={compressingFile === record.name}
+                            onClick={(e) => handleCompressFile(record, e)}
+                            className="action-btn"
+                        >
+                            压缩
                         </Button>
                     )}
                     <Popconfirm
@@ -1482,6 +1659,22 @@ const FileList: React.FC = () => {
                                         onClick={handleBatchBurn}
                                     >
                                         批量烧录{withAss > 0 ? ` (${withAss})` : ''}
+                                    </Button>
+                                </Tooltip>
+                            );
+                        })()}
+                        {(() => {
+                            const compressible = getCompressibleCount();
+                            return (
+                                <Tooltip title={compressible > 0 ? `可压缩 ${compressible} 个视频` : '选中的文件中没有可压缩的视频'}>
+                                    <Button
+                                        size="small"
+                                        type="default"
+                                        loading={batchCompressing}
+                                        disabled={compressible === 0}
+                                        onClick={handleBatchCompress}
+                                    >
+                                        批量压缩{compressible > 0 ? ` (${compressible})` : ''}
                                     </Button>
                                 </Tooltip>
                             );

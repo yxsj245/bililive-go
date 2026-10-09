@@ -24,6 +24,9 @@ import {
   OutputTemplatePreview, getFFmpegInheritance, getFFmpegDisplayValue,
 } from './shared-fields';
 import CloudUploadSettings from './CloudUploadSettings';
+import HardwareStatusCard, { useHardwareStatus } from './HardwareStatusCard';
+import Rk3588Fields from './Rk3588Fields';
+import { HardwareStatus, Rk3588Config, describeRk3588Config, normalizeRk3588Config } from '../../types/hardware';
 
 const api = new API();
 const { TextArea } = Input;
@@ -94,6 +97,8 @@ interface EffectiveConfig {
     burn_subtitles_preset: string;
     burn_delete_ass: boolean;
     burn_delete_source: boolean;
+    /** RK3588 硬件压缩配置（后端未返回该字段时为 undefined） */
+    rk3588?: Rk3588Config;
   };
   openlist: {
     port: number;
@@ -377,6 +382,8 @@ const GlobalSettings: React.FC<{
   loading: boolean;
 }> = ({ config, onUpdate, loading }) => {
   const [form] = Form.useForm();
+  // 硬件探测状态（探测结果，不等于实测）
+  const { status: hardwareStatus, loading: hardwareLoading, reload: reloadHardwareStatus } = useHardwareStatus();
 
   useEffect(() => {
     if (config) {
@@ -388,6 +395,11 @@ const GlobalSettings: React.FC<{
           ...config.video_split_strategies,
           max_duration: config.video_split_strategies.max_duration / 1000000000
         } : undefined,
+        // RK3588 硬件压缩：后端未返回该字段时按前端默认值展示，避免出现空白控件
+        on_record_finished: {
+          ...config.on_record_finished,
+          rk3588: normalizeRk3588Config(config.on_record_finished?.rk3588),
+        },
         stream_preference: config.stream_preference ? {
           ...config.stream_preference,
           attributes: config.stream_preference.attributes
@@ -703,6 +715,20 @@ const GlobalSettings: React.FC<{
               <Switch />
             </Form.Item>
           </ConfigField>
+        </Card>
+
+        {/* RK3588 硬件压缩 */}
+        <Card title="RK3588 硬件压缩" size="small" style={{ marginBottom: 16 }} id="global-rk3588">
+          <HardwareStatusCard
+            rk3588={config.on_record_finished?.rk3588}
+            status={hardwareStatus}
+            loading={hardwareLoading}
+            onReload={reloadHardwareStatus}
+          />
+          <Rk3588Fields
+            namePrefix={['on_record_finished', 'rk3588']}
+            hardwareStatus={hardwareStatus}
+          />
         </Card>
 
         {/* 云盘上传设置（开发中） */}
@@ -1631,14 +1657,33 @@ export const RoomConfigForm: React.FC<{
   loading: boolean;
   onRefresh?: () => void;
   platformId?: string; // New prop for explicit platform ID
-}> = ({ room, globalConfig, onSave, loading, onRefresh, platformId }) => {
+  hardwareStatus?: HardwareStatus | null; // 硬件探测状态（可选，用于编码器提示）
+}> = ({ room, globalConfig, onSave, loading, onRefresh, platformId, hardwareStatus }) => {
   const [form] = Form.useForm();
+  // 本房间自己的 RK3588 覆盖配置；null 表示未覆盖（继承全局）
+  const [roomRk3588, setRoomRk3588] = useState<Rk3588Config | null>(null);
+  const roomRk3588Override = Form.useWatch('rk3588_override', form);
+  const roomDetailRequestedRef = useRef('');
+  // 列表接口可能已带房间覆盖值，否则使用单独查询到的值；null 表示本房间未覆盖
+  const inlineRoomRk3588 = room?.on_record_finished?.rk3588
+    ?? room?.room_config?.on_record_finished?.rk3588
+    ?? null;
+  const effectiveRoomRk3588: Rk3588Config | null = inlineRoomRk3588
+    ? normalizeRk3588Config(inlineRoomRk3588)
+    : roomRk3588;
 
   useEffect(() => {
     if (room) {
+      // 列表接口可能已带房间覆盖；否则使用单独查询到的覆盖值
+      const inlineRk3588 = room?.on_record_finished?.rk3588
+        ?? room?.room_config?.on_record_finished?.rk3588
+        ?? null;
+      const effectiveRk3588 = inlineRk3588 ?? roomRk3588;
       // 转换 attributes: map -> array
       const displayRoom = {
         ...room,
+        rk3588_override: !!effectiveRk3588,
+        on_record_finished: { rk3588: normalizeRk3588Config(effectiveRk3588) },
         stream_preference: room.stream_preference ? {
           ...room.stream_preference,
           attributes: room.stream_preference.attributes
@@ -1648,7 +1693,36 @@ export const RoomConfigForm: React.FC<{
       };
       form.setFieldsValue(displayRoom);
     }
-  }, [room, form]);
+  }, [room, form, roomRk3588]);
+
+  // 列表接口未返回房间覆盖配置时，按需查询一次直播间详情补全显示
+  useEffect(() => {
+    const liveId = room?.live_id;
+    if (!liveId || inlineRoomRk3588 !== null) {
+      return;
+    }
+    if (roomDetailRequestedRef.current === liveId) {
+      return;
+    }
+    roomDetailRequestedRef.current = liveId;
+
+    let cancelled = false;
+    api.getLiveDetail(liveId)
+      .then((detail: any) => {
+        if (cancelled) {
+          return;
+        }
+        const raw = detail?.room_config?.on_record_finished?.rk3588 ?? null;
+        setRoomRk3588(raw ? normalizeRk3588Config(raw) : null);
+      })
+      .catch((error: any) => {
+        console.error('获取直播间覆盖配置失败:', error);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [room, form, inlineRoomRk3588]);
 
   const handleSubmit = async () => {
     try {
@@ -1661,13 +1735,25 @@ export const RoomConfigForm: React.FC<{
           attributesMap[item.key] = item.value;
         }
       }
-      const updatedValues = {
+      const updatedValues: any = {
         ...values,
         stream_preference: values.stream_preference ? {
           quality: values.stream_preference.quality || undefined,
           attributes: Object.keys(attributesMap).length > 0 ? attributesMap : undefined
         } : undefined
       };
+      // RK3588 压缩：开启覆盖则提交本房间参数；关闭覆盖且本房间原有覆盖时提交 null 清除，恢复继承全局
+      const rk3588OverrideOn = !!values.rk3588_override;
+      delete updatedValues.rk3588_override;
+      if (rk3588OverrideOn) {
+        updatedValues.on_record_finished = {
+          rk3588: normalizeRk3588Config(values.on_record_finished?.rk3588)
+        };
+      } else if (effectiveRoomRk3588) {
+        updatedValues.on_record_finished = { rk3588: null };
+      } else {
+        delete updatedValues.on_record_finished;
+      }
       await onSave(updatedValues);
       message.success('直播间配置已更新');
       if (onRefresh) onRefresh();
@@ -1941,6 +2027,32 @@ export const RoomConfigForm: React.FC<{
         </Form.List>
       </ConfigField>
 
+      {/* RK3588 硬件压缩 - 房间级覆盖 */}
+      <Divider style={{ fontSize: 12, margin: '12px 0' }}>RK3588 硬件压缩（覆盖全局）</Divider>
+
+      <ConfigField
+        label="按房间覆盖压缩参数"
+        description="关闭时继承全局设置；开启后使用本房间的编码器、码率与缩放参数。"
+        inheritance={{
+          source: 'global',
+          linkTo: '/configInfo?tab=global#global-rk3588',
+          isOverridden: !!effectiveRoomRk3588,
+          inheritedValue: describeRk3588Config(globalConfig?.on_record_finished?.rk3588)
+        }}
+        id={`rooms-live-${room.live_id}-rk3588`}
+      >
+        <Form.Item name="rk3588_override" valuePropName="checked" noStyle>
+          <Switch />
+        </Form.Item>
+      </ConfigField>
+
+      <Rk3588Fields
+        namePrefix={['on_record_finished', 'rk3588']}
+        hardwareStatus={hardwareStatus}
+        inheritedConfig={globalConfig?.on_record_finished?.rk3588}
+        disabled={!roomRk3588Override}
+      />
+
       <div className="config-actions" style={{ marginTop: 16 }}>
         <Button
           type="primary"
@@ -1975,6 +2087,8 @@ const RoomSettings: React.FC<{
 }> = ({ platformStats, globalConfig, onUpdate, loading, onRefresh }) => {
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
   const [searchText, setSearchText] = useState('');
+  // 硬件探测状态（探测结果，不等于实测）
+  const { status: hardwareStatus } = useHardwareStatus();
 
   const location = useLocation();
 
@@ -2045,6 +2159,7 @@ const RoomSettings: React.FC<{
               onSave={(updates) => onUpdate(room.live_id, updates)}
               loading={loading}
               onRefresh={onRefresh}
+              hardwareStatus={hardwareStatus}
             />
           </Panel>
         ))}

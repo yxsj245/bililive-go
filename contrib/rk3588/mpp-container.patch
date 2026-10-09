@@ -1,0 +1,12 @@
+diff --git a/osal/mpp_soc.c b/osal/mpp_soc.c
+--- a/osal/mpp_soc.c
++++ b/osal/mpp_soc.c
+@@ -1119,7 +1119,7 @@ RK_S32 mpp_coding_to_index(MppCodingType coding)
+ 
+ static void read_soc_name(char *name, rk_s32 size)
+ {
+-    const char *path = "/proc/device-tree/compatible";
++    const char *path = "/opt/rk3588/device-tree/compatible";
+     char *ptr = NULL;
+     rk_s32 fd = open(path, O_RDONLY);
+ 
