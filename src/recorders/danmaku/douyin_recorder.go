@@ -42,7 +42,7 @@ func (r *DouyinDanmakuRecorder) Start(ctx context.Context) error {
 
 	r.startAt = time.Now()
 
-	assWriter, err := NewAssWriter(r.outputFile, r.startAt, r.cfg, "Douyin Danmaku")
+	assWriter, err := NewDanmakuWriter(r.outputFile, r.startAt, r.cfg, "Douyin Danmaku")
 	if err != nil {
 		return err
 	}

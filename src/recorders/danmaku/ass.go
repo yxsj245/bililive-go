@@ -3,8 +3,6 @@ package danmaku
 import (
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -31,19 +29,18 @@ type AssWriter struct {
 	laneLast     []int64 // last tail-clear time (centiseconds) per lane
 }
 
+// parseResolution 解析弹幕画布分辨率，非法值时回退到 1920x1080。
+// 实际校验统一由 configs.ParseDanmakuResolution 提供（支持竖屏，限制边长与宽高比）。
 func parseResolution(res string) (int, int) {
-	parts := strings.SplitN(res, "x", 2)
-	if len(parts) != 2 {
-		return 1920, 1080
-	}
-	x, err1 := strconv.Atoi(parts[0])
-	y, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil {
+	x, y, err := configs.ParseDanmakuResolution(res)
+	if err != nil || x <= 0 || y <= 0 {
 		return 1920, 1080
 	}
 	return x, y
 }
 
+// NewAssWriter 创建横向滚动布局写入器（原签名与行为保持不变，始终为 scroll 布局）。
+// 需要按 danmaku.layout 自动选择布局时，请使用 NewDanmakuWriter。
 func NewAssWriter(filePath string, startAt time.Time, cfg configs.DanmakuConfig, title string) (*AssWriter, error) {
 	f, err := os.Create(filePath)
 	if err != nil {
@@ -57,7 +54,11 @@ func NewAssWriter(filePath string, startAt time.Time, cfg configs.DanmakuConfig,
 		bannerSpeed = 1
 	}
 
+	// 尺寸护栏：极端分辨率或超大字体时，避免泳道数量为 0 导致除零
 	laneHeight := cfg.FontSize + 4
+	if laneHeight < 1 {
+		laneHeight = 1
+	}
 	totalLanes := resY / laneHeight
 
 	// Determine usable lane range based on scroll_area
@@ -80,6 +81,9 @@ func NewAssWriter(filePath string, startAt time.Time, cfg configs.DanmakuConfig,
 	laneNum := laneEnd - laneStart
 	if laneNum < 1 {
 		laneNum = 1
+	}
+	if scrollTimeMs < 1000 {
+		scrollTimeMs = 1000
 	}
 
 	w := &AssWriter{

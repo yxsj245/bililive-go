@@ -1851,6 +1851,34 @@ func applyConfigUpdates(c *configs.Config, updates map[string]interface{}) error
 		if scPosition, ok := danmaku["sc_position"].(string); ok {
 			c.Danmaku.ScPosition = scPosition
 		}
+		if layout, ok := danmaku["layout"].(string); ok {
+			c.Danmaku.Layout = configs.NormalizeLayout(layout)
+		}
+		if chat, ok := danmaku["chat"].(map[string]interface{}); ok {
+			if c.Danmaku.Chat == nil {
+				defaultChat := configs.DefaultChatLayoutConfig()
+				c.Danmaku.Chat = &defaultChat
+			} else {
+				// 先克隆再修改，避免就地更新污染配置快照或校验失败时残留半成品
+				cloned := c.Danmaku.Chat.Clone()
+				c.Danmaku.Chat = &cloned
+			}
+			if rows, ok := chat["rows"].(float64); ok {
+				c.Danmaku.Chat.Rows = int(rows)
+			}
+			if widthPercent, ok := chat["width_percent"].(float64); ok {
+				c.Danmaku.Chat.WidthPercent = int(widthPercent)
+			}
+			if bottomPercent, ok := chat["bottom_percent"].(float64); ok {
+				c.Danmaku.Chat.BottomPercent = configs.IntPtr(int(bottomPercent))
+			}
+			if staySeconds, ok := chat["stay_seconds"].(float64); ok {
+				c.Danmaku.Chat.StaySeconds = int(staySeconds)
+			}
+			if maxLines, ok := chat["max_lines_per_item"].(float64); ok {
+				c.Danmaku.Chat.MaxLinesPerItem = int(maxLines)
+			}
+		}
 		if err := c.Danmaku.Validate(); err != nil {
 			return fmt.Errorf("弹幕参数无效: %w", err)
 		}
@@ -2543,6 +2571,35 @@ func applyOverridableConfigUpdates(oc *configs.OverridableConfig, updates map[st
 		}
 		if scPosition, ok := danmaku["sc_position"].(string); ok {
 			oc.Danmaku.ScPosition = scPosition
+		}
+		if layout, ok := danmaku["layout"].(string); ok {
+			oc.Danmaku.Layout = configs.NormalizeLayout(layout)
+		}
+		if chat, ok := danmaku["chat"].(map[string]interface{}); ok {
+			if oc.Danmaku.Chat == nil {
+				// 与 oc.Danmaku 的初始化方式保持一致：从默认值起步，避免未提交字段被零值覆盖
+				defaultChat := configs.DefaultChatLayoutConfig()
+				oc.Danmaku.Chat = &defaultChat
+			} else {
+				// 先克隆再修改，避免就地更新污染全局配置或调用方的快照
+				cloned := oc.Danmaku.Chat.Clone()
+				oc.Danmaku.Chat = &cloned
+			}
+			if rows, ok := chat["rows"].(float64); ok {
+				oc.Danmaku.Chat.Rows = int(rows)
+			}
+			if widthPercent, ok := chat["width_percent"].(float64); ok {
+				oc.Danmaku.Chat.WidthPercent = int(widthPercent)
+			}
+			if bottomPercent, ok := chat["bottom_percent"].(float64); ok {
+				oc.Danmaku.Chat.BottomPercent = configs.IntPtr(int(bottomPercent))
+			}
+			if staySeconds, ok := chat["stay_seconds"].(float64); ok {
+				oc.Danmaku.Chat.StaySeconds = int(staySeconds)
+			}
+			if maxLines, ok := chat["max_lines_per_item"].(float64); ok {
+				oc.Danmaku.Chat.MaxLinesPerItem = int(maxLines)
+			}
 		}
 	} else if _, exists := updates["danmaku"]; exists && updates["danmaku"] == nil {
 		// 显式 null → 清除覆盖，恢复继承

@@ -43,7 +43,7 @@ func (d *DanmakuRecorder) Start(ctx context.Context) error {
 
 	d.startAt = time.Now()
 
-	assWriter, err := NewAssWriter(d.outputFile, d.startAt, d.cfg, "Bilibili Danmaku")
+	assWriter, err := NewDanmakuWriter(d.outputFile, d.startAt, d.cfg, "Bilibili Danmaku")
 	if err != nil {
 		return fmt.Errorf("failed to create ass writer: %w", err)
 	}
